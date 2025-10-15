@@ -1,214 +1,297 @@
-#!/usr/bin/env python3
+# laa_strategy_report.py
 # -*- coding: utf-8 -*-
-"""
-LAA Timing Signals (Monthly, hardened)
-
-타이밍 룰(포트의 25% 슬리브 가정):
-  - (S&P500 가격 < SMA) AND (실업률 > 12M MA) → SHY(미국 단기국채)
-  - 그 외 → QQQ(나스닥)
-
-개선/방어:
-  - FRED 발표 랙(룩어헤드) 방지: 실업률을 fred_lag개월 시프트 후 12M MA 계산
-  - yfinance 컬럼 변화 대응: 'Adj Close' 없으면 'Close'
-  - SMA 계산 데이터 부족 체크
-  - resample('M') → 'ME'로 변경 (FutureWarning 제거)
-  - 컬럼명 강제 지정 + 입력 정규화 (SPX 컬럼 유실/멀티인덱스 방지)
-  - 동적 SMA 컬럼명 처리
-  - CSV 반올림/포맷
-  - CLI 인자 지원
-
-설치(uv):
-  uv venv .venv && source .venv/bin/activate
-  uv pip install pandas yfinance pandas-datareader python-dateutil
-
-실행 예:
-  python laa_signals.py --years 25 --sma 200 --fred-lag 1
-"""
-
-from __future__ import annotations
-import argparse
-from pathlib import Path
-
+import os
+from datetime import datetime
+import numpy as np
 import pandas as pd
 import yfinance as yf
 from pandas_datareader import data as pdr
 
-# -----------------------
-# 기본 파라미터
-# -----------------------
-SPX_TICKER_DEFAULT = "^GSPC"   # 필요 시 'SPY'
-FRED_SERIES = "UNRATE"         # 미국 실업률(월별, %)
-YEARS_DEFAULT = 25
-SMA_WINDOW_DEFAULT = 200
-FRED_LAG_DEFAULT = 1
-OUT_DIR = Path("./laa_out")
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side, NamedStyle
+from openpyxl.utils import get_column_letter
 
+OUT_DIR = "laa_out"
+os.makedirs(OUT_DIR, exist_ok=True)
 
-# -----------------------
-# 데이터 취득 / 정규화
-# -----------------------
-def fetch_spx(start: str, end: str, ticker: str, sma_window: int) -> pd.DataFrame:
-    """
-    S&P500(또는 SPY) 일별 종가 + SMA 계산.
-    - auto_adjust=False 명시
-    - 'Adj Close' 없으면 'Close'
-    - 반환 시 컬럼명을 ["SPX", f"SPX_SMA{sma_window}"]로 강제 지정
-    """
-    df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=False)
-    if df.empty:
-        raise RuntimeError(f"{ticker} 데이터를 가져오지 못했습니다.")
+# =========================
+# 설정
+# =========================
+START_DATE = "2000-01-01"
+SPX_TICKER = "^GSPC"       # S&P 500 Index
+UNRATE_SER = "UNRATE"      # FRED 미국 실업률(%) 월간
+FIXED_ASSETS = [
+    ("미국 대형가치주", "IWD", 0.25),
+    ("금",           "GLD", 0.25),
+    ("미국 중기국채", "IEF", 0.25),
+]
+TIMING_PAIR = ("QQQ", "SHY")  # (위험자산, 안전자산)
+TIMING_WEIGHT = 0.25
 
-    col = "Adj Close" if "Adj Close" in df.columns else "Close"
-    px = df[col].copy().dropna()
-    if px.shape[0] < sma_window + 5:
-        raise RuntimeError(f"SMA{sma_window} 계산에 데이터가 부족합니다. 보유={px.shape[0]}개 일봉.")
+# =========================
+# 데이터 로딩
+# =========================
+def load_daily_close(ticker: str, start=START_DATE) -> pd.Series:
+    # auto_adjust를 명시적으로 False로 지정해 경고 제거
+    df = yf.download(ticker, start=start, progress=False, auto_adjust=False)
+    if df.empty or "Close" not in df:
+        raise RuntimeError(f"{ticker} 데이터를 불러오지 못했습니다.")
+    s = df["Close"]
+    if isinstance(s, pd.DataFrame):
+        s = s.iloc[:, 0]
+    s = s.dropna()
+    s.name = ticker
+    return s
 
-    sma = px.rolling(sma_window).mean()
-    # 강제 컬럼명 지정 (이름 유실/멀티인덱스 방지)
-    out = pd.concat([px, sma], axis=1).dropna()
-    out.columns = ["SPX", f"SPX_SMA{sma_window}"]
-    return out
+def load_unrate(start=START_DATE) -> pd.Series:
+    """FRED UNRATE(%) 월간 → 반드시 1D Series로 정규화"""
+    df = pdr.DataReader(UNRATE_SER, "fred", start=start)
+    if df is None or df.empty:
+        raise RuntimeError("UNRATE 데이터를 불러오지 못했습니다.")
+    # squeeze로 1D 보장
+    s = df.squeeze("columns")
+    if isinstance(s, pd.DataFrame):
+        s = s.iloc[:, 0]
+    s = s.dropna()
+    s.name = "UNRATE(%)"
+    return s
 
+# =========================
+# 신호 계산
+# =========================
+def compute_signals():
+    # 1) S&P500 일별 종가 + 200거래일 SMA
+    spx = load_daily_close(SPX_TICKER)
+    spx_sma200 = spx.rolling(window=200, min_periods=200).mean()
 
-def safe_read_fred(start: str, end: str) -> pd.Series:
-    """FRED(UNRATE) 안전 호출."""
-    try:
-        s = pdr.DataReader(FRED_SERIES, "fred", start=start, end=end).iloc[:, 0]
-        s.name = "UNRATE"
-        return s
-    except Exception as e:
-        raise RuntimeError(f"FRED(UNRATE) 다운로드 실패: {e}")
+    # 2) 월말 샘플링: 'ME' 사용 + 월(period) 정렬
+    #    - 거래일 월말이 실제 달의 말일과 다를 수 있으므로 period 기준으로 정규화
+    spx_me = spx.resample("ME").last()  # month end
+    sma200_me = spx_sma200.reindex(spx.index, method="ffill").resample("ME").last()
 
+    # period(M) 인덱스로 변환
+    spx_p = spx_me.to_period("M")
+    sma200_p = sma200_me.to_period("M")
 
-def fetch_unrate(start: str, end: str) -> pd.Series:
-    return safe_read_fred(start, end)
+    # 3) UNRATE 월간 + 12개월 이동평균 (원래 월간이므로 바로 period로 맞춤)
+    ur = load_unrate()
+    ur_12m = ur.rolling(window=12, min_periods=12).mean()
 
+    ur_p = ur.to_period("M")
+    ur12_p = ur_12m.to_period("M")
 
-def _normalize_spx_df(spx: pd.DataFrame | pd.Series, sma_window: int) -> pd.DataFrame:
-    """
-    build_monthly_signals() 진입 전 방어:
-      - Series면 DataFrame으로
-      - MultiIndex 컬럼이면 1단계 평탄화
-      - 'SPX' 컬럼 없으면 첫 컬럼을 'SPX'로 리네임
-      - SMA 컬럼 없으면 즉시 재계산 후 부착
-    """
-    if isinstance(spx, pd.Series):
-        spx = spx.to_frame(name="SPX")
+    # 4) 공통 period(M) 인덱스 교집합
+    common_p = spx_p.index.intersection(ur_p.index)
+    if len(common_p) == 0:
+        raise RuntimeError("공통 월(period) 인덱스가 비었습니다. 데이터 수집 기간/네트워크를 확인하세요.")
 
-    # MultiIndex → 단순 문자열
-    spx.columns = [c[0] if isinstance(c, tuple) else c for c in spx.columns]
+    # 5) 공통 period로 재색인 후 month-end 타임스탬프로 되돌리기
+    spx_p = spx_p.reindex(common_p)
+    sma200_p = sma200_p.reindex(common_p)
+    ur_p = ur_p.reindex(common_p)
+    ur12_p = ur12_p.reindex(common_p)
 
-    if "SPX" not in spx.columns:
-        # 첫 컬럼을 SPX로 간주
-        spx = spx.rename(columns={spx.columns[0]: "SPX"})
+    # period → 실제 달의 말일 타임스탬프
+    idx_ts = common_p.to_timestamp("M", how="end")
 
-    sma_cols = [c for c in spx.columns if c.startswith("SPX_SMA")]
-    if not sma_cols:
-        sma = spx["SPX"].rolling(sma_window).mean()
-        spx = pd.concat([spx["SPX"], sma.rename(f"SPX_SMA{sma_window}")], axis=1)
+    spx_m = pd.Series(spx_p.values, index=idx_ts, name="SPX_Close")
+    sma200_m = pd.Series(sma200_p.values, index=idx_ts, name="SPX_200D_SMA")
+    ur_m = pd.Series(ur_p.values, index=idx_ts, name="UNRATE(%)")
+    ur12_m = pd.Series(ur12_p.values, index=idx_ts, name="UNRATE_12M(%)")
 
-    return spx
+    # 6) 합치기
+    df = pd.concat([spx_m, sma200_m, ur_m, ur12_m], axis=1)
 
+    # 7) 신호 계산
+    cond_price = df["SPX_Close"] < df["SPX_200D_SMA"]
+    cond_unemp = df["UNRATE(%)"] > df["UNRATE_12M(%)"]
+    df["TimingChoice"] = np.where(cond_price & cond_unemp, "SHY", "QQQ")
 
-# -----------------------
-# 시그널 생성
-# -----------------------
-def build_monthly_signals(
-    spx: pd.DataFrame,
-    unrate: pd.Series,
-    fred_lag_months: int = 1,
-    sma_window: int = 200,
-) -> pd.DataFrame:
-    # 입력 정규화 (SPX/SMA 보장)
-    spx = _normalize_spx_df(spx, sma_window=sma_window)
+    # 초기 결측 제거
+    df = df.dropna(subset=["SPX_Close", "SPX_200D_SMA", "UNRATE(%)", "UNRATE_12M(%)"])
 
-    # 월말 집계: 'ME' = MonthEnd
-    spx_m = spx.resample("ME").last()
-    spx_m.index.name = "DATE"
-
-    # SMA 컬럼명 확보 (동적)
-    sma_cols = [c for c in spx_m.columns if c.startswith("SPX_SMA")]
-    if not sma_cols:
-        sma = spx_m["SPX"].rolling(sma_window).mean()
-        spx_m = pd.concat([spx_m, sma.rename(f"SPX_SMA{sma_window}")], axis=1)
-        sma_cols = [c for c in spx_m.columns if c.startswith("SPX_SMA")]
-        if not sma_cols:
-            raise RuntimeError("SMA 컬럼을 찾지 못했습니다 (SPX_SMA###).")
-    sma_col = sma_cols[0]
-
-    # 실업률: 발표 랙 보정 후 12M MA
-    un_m = unrate.copy()
-    un_m.index = pd.to_datetime(un_m.index)
-    un_m = un_m.resample("ME").last()
-    un_m_lagged = un_m.shift(fred_lag_months)
-    un_ma12 = un_m_lagged.rolling(12).mean().rename("UNRATE_MA12")
-
-    df = pd.concat([spx_m, un_m_lagged.rename("UNRATE"), un_ma12], axis=1).dropna()
-
-    # 조건
-    df["PRICE_ABOVE_SMA200"] = (df["SPX"] > df[sma_col])
-    df["UNEMP_ABOVE_MA12"]   = (df["UNRATE"] > df["UNRATE_MA12"])
-
-    # 타이밍 자산
-    df["TIMING_ASSET"] = df.apply(
-        lambda r: "SHY (미국 단기국채)"
-        if (not r["PRICE_ABOVE_SMA200"] and r["UNEMP_ABOVE_MA12"])
-        else "QQQ (나스닥)",
-        axis=1,
-    )
     return df
 
+# =========================
+# 현재 배분(목표 비중) 산출
+# =========================
+def current_allocation(signals_df: pd.DataFrame):
+    if signals_df.empty:
+        raise RuntimeError("신호 데이터가 비어 있습니다.")
+    last_date = signals_df.index[-1]
+    timing_choice = signals_df.loc[last_date, "TimingChoice"]
 
-# -----------------------
-# 저장/출력
-# -----------------------
-def round_and_save(signals: pd.DataFrame, out_path: Path) -> None:
-    csv_out = signals.copy()
-    sma_cols = [c for c in csv_out.columns if c.startswith("SPX_SMA")]
-    for c in ["SPX", "UNRATE", "UNRATE_MA12"] + sma_cols:
-        if c in csv_out.columns:
-            csv_out[c] = csv_out[c].round(2)
-    csv_out.to_csv(out_path, encoding="utf-8-sig", date_format="%Y-%m")
+    # 고정자산(연 1회 리밸런싱 가정의 '목표 비중'을 보여줌)
+    rows = []
+    for name, ticker, w in FIXED_ASSETS:
+        rows.append([name, ticker, round(w * 100, 2)])
 
+    # 타이밍(월 1회 리밸런싱)
+    rows.append(["타이밍 자산", timing_choice, round(TIMING_WEIGHT * 100, 2)])
 
-def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="LAA 월별 타이밍 시그널 생성기")
-    ap.add_argument("--years", type=int, default=YEARS_DEFAULT, help="가져올 연도 범위")
-    ap.add_argument("--sma", type=int, default=SMA_WINDOW_DEFAULT, help="SMA 윈도우(일)")
-    ap.add_argument("--fred-lag", type=int, default=FRED_LAG_DEFAULT, help="FRED 발표 랙(개월)")
-    ap.add_argument("--ticker", type=str, default=SPX_TICKER_DEFAULT, help="S&P500 티커(^GSPC 또는 SPY)")
-    ap.add_argument("--out", type=str, default=str(OUT_DIR / "laa_signals.csv"), help="출력 CSV 경로")
-    return ap.parse_args()
+    alloc_df = pd.DataFrame(rows, columns=["자산군", "티커", "목표비중(%)"])
+    alloc_df["기준일"] = last_date.date()
+    return alloc_df, last_date, timing_choice
 
+# =========================
+# 엑셀 저장
+# =========================
+def autosize_columns(ws, max_width=60):
+    widths = {}
+    for row in ws.iter_rows(values_only=True):
+        for i, v in enumerate(row, start=1):
+            v = "" if v is None else str(v)
+            widths[i] = max(widths.get(i, 0), len(v))
+    for i, w in widths.items():
+        ws.column_dimensions[get_column_letter(i)].width = min(max(w + 2, 12), max_width)
 
-def main():
-    args = parse_args()
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+def build_excel(signals_df: pd.DataFrame, alloc_df: pd.DataFrame, last_date, timing_choice):
+    month_str = datetime.now().strftime("%Y-%m")
+    xlsx_path = os.path.join(OUT_DIR, f"laa_report_{month_str}.xlsx")
 
-    today = pd.Timestamp.today().normalize()
-    start = (today - pd.DateOffset(years=args.years)).strftime("%Y-%m-%d")
-    end = today.strftime("%Y-%m-%d")
+    wb = Workbook()
+    # 기본 시트 제거
+    wb.remove(wb.active)
 
-    spx = fetch_spx(start, end, ticker=args.ticker, sma_window=args.sma)
-    un  = fetch_unrate(start, end)
+    # 공통 스타일
+    title_fill = PatternFill("solid", fgColor="E6F0FF")
+    header_fill = PatternFill("solid", fgColor="F2F2F2")
+    thin = Side(style="thin", color="D9D9D9")
+    border_all = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    signals = build_monthly_signals(spx, un, fred_lag_months=args.fred_lag, sma_window=args.sma)
+    # Named styles
+    if "percent_style" not in wb.named_styles:
+        st = NamedStyle(name="percent_style"); st.number_format = "0.00%"; wb.add_named_style(st)
+    if "number_style" not in wb.named_styles:
+        st = NamedStyle(name="number_style"); st.number_format = "#,##0.00"; wb.add_named_style(st)
 
-    out_path = Path(args.out)
-    round_and_save(signals, out_path)
+    # ===== Sheet 1: Summary (현재 목표 배분) =====
+    ws1 = wb.create_sheet("Summary")
+    ws1.merge_cells(start_row=1, start_column=1, end_row=1, end_column=6)
+    c = ws1.cell(row=1, column=1, value=f"LAA Summary — {month_str}")
+    c.font = Font(size=14, bold=True); c.fill = title_fill
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws1.row_dimensions[1].height = 24
 
-    # 최근 월 요약
-    last = signals.dropna().iloc[-1]
-    sma_cols = [c for c in signals.columns if c.startswith("SPX_SMA")]
-    sma_col = sma_cols[0] if sma_cols else f"SPX_SMA{args.sma}"
+    # 배너
+    banner = f"현재 타이밍 자산: {timing_choice}  |  기준일: {last_date.date()}"
+    ws1.cell(row=3, column=1, value=banner).font = Font(bold=True)
 
-    print("=== LAA 타이밍 시그널 (최근 월) ===")
-    print(f"기준월: {last.name.strftime('%Y-%m')}")
-    print(f"S&P500 종가: {last['SPX']:.2f} | {sma_col}: {last[sma_col]:.2f} | Above? {bool(last['PRICE_ABOVE_SMA200'])}")
-    print(f"실업률: {last['UNRATE']:.2f}% | 12M MA: {last['UNRATE_MA12']:.2f}% | Unemp>MA12? {bool(last['UNEMP_ABOVE_MA12'])}")
-    print(f"▶ 타이밍 자산 선택: {last['TIMING_ASSET']}")
-    print(f"\nCSV 저장: {out_path.resolve()}")
+    # 표 헤더
+    headers = ["자산군", "티커", "목표비중(%)", "비고"]
+    for col, h in enumerate(headers, start=1):
+        cell = ws1.cell(row=5, column=col, value=h)
+        cell.font = Font(bold=True); cell.fill = header_fill
+        cell.border = border_all; cell.alignment = Alignment(horizontal="center")
 
+    # 데이터
+    r = 6
+    for _, row in alloc_df.iterrows():
+        ws1.cell(row=r, column=1, value=row["자산군"]).border = border_all
+        ws1.cell(row=r, column=2, value=row["티커"]).border = border_all
+        c3 = ws1.cell(row=r, column=3, value=float(row["목표비중(%)"]) / 100.0)
+        c3.border = border_all; c3.style = "percent_style"
+        ws1.cell(row=r, column=4, value="" if row["자산군"] != "타이밍 자산" else "월 1회 리밸런싱").border = border_all
+        r += 1
 
+    ws1.freeze_panes = "A6"
+    autosize_columns(ws1, max_width=40)
+
+    # ===== Sheet 2: Signals (월말 S&P/200D, 실업률/12M, 타이밍) =====
+    ws2 = wb.create_sheet("Signals")
+
+    ws2.merge_cells(start_row=1, start_column=1, end_row=1, end_column=10)
+    c2 = ws2.cell(row=1, column=1, value=f"Signals — 월말 기준 (S&P500 vs 200D, 실업률 vs 12M, 타이밍) — {month_str}")
+    c2.font = Font(size=14, bold=True); c2.fill = title_fill
+    c2.alignment = Alignment(horizontal="center", vertical="center")
+    ws2.row_dimensions[1].height = 24
+
+    # 보기 좋게 최근 120개월만 표시 (필요시 변경)
+    sig = signals_df.copy()
+    if len(sig) > 120:
+        sig = sig.iloc[-120:].copy()
+
+    sig_out = sig.reset_index().rename(columns={
+        "index": "월말",
+        "SPX_Close": "미국 S&P 500 지수 가격",
+        "SPX_200D_SMA": "200일 이동평균 가격",
+        "UNRATE(%)": "미국 실업률(%)",
+        "UNRATE_12M(%)": "12개월 이동평균(%)",
+        "TimingChoice": "타이밍 선택(월말)"
+    })
+
+    # 헤더
+    for col, h in enumerate(sig_out.columns, start=1):
+        cell = ws2.cell(row=3, column=col, value=h)
+        cell.font = Font(bold=True); cell.fill = header_fill
+        cell.border = border_all; cell.alignment = Alignment(horizontal="center")
+
+    # 데이터 + 서식
+    r = 4
+    for _, row in sig_out.iterrows():
+        ws2.cell(row=r, column=1, value=row["월말"].date()).border = border_all
+
+        cpx = ws2.cell(row=r, column=2, value=float(row["미국 S&P 500 지수 가격"]))
+        cpx.border = border_all; cpx.style = "number_style"
+
+        csma = ws2.cell(row=r, column=3, value=float(row["200일 이동평균 가격"]))
+        csma.border = border_all; csma.style = "number_style"
+
+        # 실업률은 백분율 → 엑셀 퍼센트 서식 적용
+        u = row["미국 실업률(%)"]
+        u12 = row["12개월 이동평균(%)"]
+        cu = ws2.cell(row=r, column=4, value=None if pd.isna(u) else float(u) / 100.0)
+        cu.border = border_all; cu.style = "percent_style"
+        cu12 = ws2.cell(row=r, column=5, value=None if pd.isna(u12) else float(u12) / 100.0)
+        cu12.border = border_all; cu12.style = "percent_style"
+
+        ws2.cell(row=r, column=6, value=row["타이밍 선택(월말)"]).border = border_all
+
+        r += 1
+
+    ws2.freeze_panes = "A4"
+    autosize_columns(ws2, max_width=52)
+
+    # ===== Sheet 3: TimingOnly (월말 타이밍만 모아서) =====
+    ws3 = wb.create_sheet("TimingOnly")
+    ws3.merge_cells(start_row=1, start_column=1, end_row=1, end_column=4)
+    c3 = ws3.cell(row=1, column=1, value=f"Timing Choice History — {month_str}")
+    c3.font = Font(size=14, bold=True); c3.fill = title_fill
+    c3.alignment = Alignment(horizontal="center", vertical="center")
+    ws3.row_dimensions[1].height = 24
+
+    # 최근 120개월만
+    t_only = signals_df[["TimingChoice"]].copy()
+    if len(t_only) > 120:
+        t_only = t_only.iloc[-120:].copy()
+    t_only = t_only.reset_index().rename(columns={"index": "월말", "TimingChoice": "타이밍 선택(월말)"})
+
+    for col, h in enumerate(t_only.columns, start=1):
+        cell = ws3.cell(row=3, column=col, value=h)
+        cell.font = Font(bold=True); cell.fill = header_fill
+        cell.border = border_all; cell.alignment = Alignment(horizontal="center")
+
+    r = 4
+    for _, row in t_only.iterrows():
+        ws3.cell(row=r, column=1, value=row["월말"].date()).border = border_all
+        ws3.cell(row=r, column=2, value=row["타이밍 선택(월말)"]).border = border_all
+        r += 1
+
+    ws3.freeze_panes = "A4"
+    autosize_columns(ws3, max_width=32)
+
+    # 저장
+    wb.save(xlsx_path)
+    print(f"✅ 엑셀 저장 완료: {xlsx_path}")
+
+# =========================
+# main
+# =========================
 if __name__ == "__main__":
-    main()
+    # 1) 신호 테이블 생성
+    signals = compute_signals()
+    # 2) 현재 목표 배분 생성
+    alloc, last_dt, timing = current_allocation(signals)
+    # 3) 엑셀 출력 (Summary / Signals / TimingOnly)
+    build_excel(signals, alloc, last_dt, timing)
+    print(f"📌 현재 타이밍 자산: {timing} (기준일: {last_dt.date()})")
