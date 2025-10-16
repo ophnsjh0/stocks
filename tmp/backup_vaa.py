@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-# vaa_korea_mapped_report_fdr.py
+# vaa_korea_mapped_report.py
 import os
 from datetime import datetime
 import pandas as pd
-import FinanceDataReader as fdr  # ✅ yfinance → FinanceDataReader
+import yfinance as yf
+
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side, NamedStyle
@@ -12,7 +13,7 @@ from openpyxl.utils import get_column_letter
 # =========================================================
 # 설정
 # =========================================================
-CONVERT_TO_KRW = True   # 미국 ETF 가격을 원화로 환산해 표기 (USDKRW 월말환율)
+CONVERT_TO_KRW = True   # 미국 ETF 가격을 원화로 환산해 표기 (USDKRW=X 월말환율)
 MIN_MONTHS = 13         # 12개월 비교(현재 포함)에 필요한 최소 월 스냅샷 수
 
 OUT_DIR = "vaa_out"
@@ -57,55 +58,26 @@ PROXY_MAP = {
 }
 
 # =========================================================
-# 환율 (KRW per USD) 월말 시리즈 (FinanceDataReader 사용)
+# 환율 (KRW per USD) 월말 시리즈
 # =========================================================
-def _read_fx_usdkrw(start="2010-01-01") -> pd.Series:
-    """
-    FinanceDataReader는 USD/KRW 심볼이 설치/버전에 따라
-    'USD/KRW', 'USDKRW', 'USD-KRW' 등으로 다를 수 있어
-    몇 가지를 시도한다. Close 컬럼 사용.
-    """
-    candidates = ["USD/KRW", "USDKRW", "USD-KRW"]
-    last_err = None
-    for sym in candidates:
-        try:
-            fx = fdr.DataReader(sym, start)
-            if not fx.empty and "Close" in fx:
-                s = fx["Close"].dropna()
-                # 일부 데이터프레임은 tz-aware가 아님. 그대로 사용.
-                return s.resample("M").last().dropna()
-        except Exception as e:
-            last_err = e
-            continue
-    raise RuntimeError(f"환율(USD/KRW) 데이터를 불러오지 못했습니다. 마지막 오류: {last_err}")
+def get_usdkrw_series(start="2010-01-01") -> pd.Series:
+    fx = yf.download("USDKRW=X", start=start, progress=False)
+    if fx.empty or "Close" not in fx:
+        raise RuntimeError("환율(USDKRW=X) 데이터를 불러오지 못했습니다.")
+    return fx["Close"].resample("M").last().dropna()
 
-USDKRW_MONTHLY = _read_fx_usdkrw()
+USDKRW_MONTHLY = get_usdkrw_series()
 
 # =========================================================
 # 데이터 핸들링
 # =========================================================
 def load_daily(ticker: str, start="2010-01-01") -> pd.DataFrame:
-    """
-    FinanceDataReader로 일봉 받기.
-    반환 컬럼: ['Open','High','Low','Close','Volume','Change'] (소스에 따라 다소 차이)
-    """
-    try:
-        df = fdr.DataReader(ticker, start)
-        # 컬럼 표준화: Close가 없으면 실패 처리
-        if df is None or df.empty or "Close" not in df.columns:
-            return pd.DataFrame()
-        # 인덱스가 DatetimeIndex가 아니면 변환 시도
-        if not isinstance(df.index, pd.DatetimeIndex):
-            df.index = pd.to_datetime(df.index)
-        df = df.sort_index()
-        return df
-    except Exception:
-        return pd.DataFrame()
+    return yf.download(ticker, start=start, progress=False)
 
 def monthly_with_current(df: pd.DataFrame) -> pd.Series:
     """
     일봉 → 월말 종가 + 현재(오늘) 종가 보강.
-    CONVERT_TO_KRW=True 이면 월별 환율(USDKRW) 곱해 KRW Series로 변환.
+    CONVERT_TO_KRW=True 이면 월별 환율(USDKRW=X) 곱해 KRW Series로 변환.
     항상 float Series 반환.
     """
     if df is None or df.empty or "Close" not in df:
@@ -117,10 +89,10 @@ def monthly_with_current(df: pd.DataFrame) -> pd.Series:
 
     monthly = close.resample("M").last().dropna()
 
-    # 현재 종가 보강(해당 월 스냅샷이 없을 때만 마지막 값을 추가)
+    # 현재 종가 보강
     last_date = close.index[-1]
-    last_close = float(close.iloc[-1])
-    if len(monthly) == 0 or (monthly.index[-1].month != last_date.month or monthly.index[-1].year != last_date.year):
+    last_close = close.iloc[-1]
+    if len(monthly) == 0 or monthly.index[-1].month != last_date.month or monthly.index[-1].year != last_date.year:
         monthly = pd.concat([monthly, pd.Series([last_close], index=[last_date])])
 
     # KRW 환산
@@ -146,12 +118,9 @@ def snapshot_momentum(monthly: pd.Series):
 
     def _scalar(x):
         if hasattr(x, "item"):
-            try:
-                return float(x.item())
-            except Exception:
-                pass
-        try:
-            return float(x)
+            try: return float(x.item())
+            except Exception: pass
+        try: return float(x)
         except Exception:
             if isinstance(x, pd.Series):
                 return float(x.iloc[0])
@@ -169,16 +138,14 @@ def snapshot_momentum(monthly: pd.Series):
     r12 = P0 / P12 - 1.0
 
     score_raw = 12*r1 + 4*r3 + 2*r6 + 1*r12
-    # score_pct = score_raw * 100.0
-    score_pct = score_raw
+    score_pct = score_raw * 100.0
 
     return r1, r3, r6, r12, score_pct, P0, P1, P3, P6, P12
 
 def resolve_with_proxy(us_ticker: str):
     """
-    미국 ETF ticker로 월 스냅샷 생성.
+    미국 ETF tiicker로 월 스냅샷 생성.
     필요시 PROXY_MAP을 이용해 대체.
-    (모두 FinanceDataReader 사용)
     """
     df = load_daily(us_ticker)
     monthly = monthly_with_current(df)
@@ -210,7 +177,7 @@ def build_summary_df():
 
         used_ticker, src, r1, r3, r6, r12, score_pct, P0, P1, P3, P6, P12 = resolve_with_proxy(us_ticker)
 
-        # 국내 투자 종목 매핑 (표시에만 사용)
+        # 국내 투자 종목 매핑
         kr_map = US_TO_KR_MAP.get(us_ticker, {"종목명": None, "Code": None, "환율": None})
 
         rows.append([
@@ -333,7 +300,7 @@ def write_detail_sheet(wb: Workbook, df: pd.DataFrame, banner: str, month_str: s
         ws.cell(row=row_cursor, column=1, value="환율표기");   ws.cell(row=row_cursor, column=2, value=ar["실제투자_환율"]); row_cursor += 1
         ws.cell(row=row_cursor, column=1, value="모멘텀 스코어")
         sc = ws.cell(row=row_cursor, column=2, value=(ar["모멘텀점수(가중합,%)"]/100.0 if pd.notna(ar["모멘텀점수(가중합,%)"]) else None))
-        sc.number_format = "0.00"; row_cursor += 1
+        sc.number_format = "0.00%"; row_cursor += 1
         row_cursor += 1
 
         # 표 헤더
@@ -378,15 +345,14 @@ def write_detail_sheet(wb: Workbook, df: pd.DataFrame, banner: str, month_str: s
         for col, v in enumerate(s_row, start=1):
             cell = ws.cell(row=row_cursor, column=col, value=v)
             cell.border = border_all
-            if col > 2 and v is not None: cell.number_format = "0.00"
+            if col > 2 and v is not None: cell.number_format = "0.00%"
         row_cursor += 1
 
         # 합계
         for col in range(1, 6):
             cell = ws.cell(row=row_cursor, column=col, value=""); cell.border = border_all
-        # tot = ws.cell(row=row_cursor, column=6, value=(ar["모멘텀점수(가중합,%)"]/100.0 if pd.notna(ar["모멘텀점수(가중합,%)"]) else None))
-        tot = ws.cell(row=row_cursor, column=6, value=(ar["모멘텀점수(가중합,%)"] if pd.notna(ar["모멘텀점수(가중합,%)"]) else None))
-        tot.number_format = "0.00"; tot.border = border_all
+        tot = ws.cell(row=row_cursor, column=6, value=(ar["모멘텀점수(가중합,%)"]/100.0 if pd.notna(ar["모멘텀점수(가중합,%)"]) else None))
+        tot.number_format = "0.00%"; tot.border = border_all
         row_cursor += 2
 
     # 공격 → 안전 순서대로 출력
