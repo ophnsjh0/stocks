@@ -38,7 +38,7 @@ DECISION_DF = pd.DataFrame(DECISION_ASSETS, columns=["분류", "의사결정기�
 US_TO_KR_MAP = {
     "SPY":  {"종목명": "KODEX 미국S&P500",              "Code": "379800", "환율": "환노출"},
     "EFA":  {"종목명": "KODEX MSCI선진국",              "Code": "251350", "환율": "환노출"},
-    "EEM":  {"종목명": "KODEX MSCI EM선물(H)",          "Code": "291890", "환율": "환해지"},
+    "EEM":  {"종목명": "PLUS 신흥국MSCI(합성 H)",          "Code": "195980", "환율": "환해지"},
     "AGG":  {"종목명": "KODEX iShares미국투자등급회사채 엑티브", "Code": "468630", "환율": "환노출"},
     "LQD":  {"종목명": "KODEX 미국종합채권ESG엑티브(H)", "Code": "437080", "환율": "환해지"},
     "IEF":  {"종목명": "ACE 미국10년국채엑티브",         "Code": "0085P0", "환율": "환노출"},
