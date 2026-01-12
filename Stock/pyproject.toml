@@ -10,6 +10,7 @@ dependencies = [
     "pandas>=2.3.3",
     "pandas-datareader>=0.10.0",
     "python-dateutil>=2.9.0.post0",
+    "pyupbit>=0.2.34",
     "setuptools>=80.9.0",
     "xlsxwriter>=3.2.9",
     "yfinance>=0.2.66",

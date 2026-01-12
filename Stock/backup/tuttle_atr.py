@@ -96,7 +96,7 @@ def export_turtle_final_v2(ticker_symbol, total_capital):
     # -------------------------------------------------------
     # 6. 엑셀 저장
     # -------------------------------------------------------
-    file_name = f"[ST&ETF]{ticker_symbol}.xlsx"
+    file_name = f"{ticker_symbol}_Turtle_Analysis_V2.xlsx"
     writer = pd.ExcelWriter(file_name, engine='xlsxwriter')
     
     # 상단 표가 길어졌으므로 시작 행을 조금 더 아래로 조정 (15행부터 데이터)

@@ -1,12 +1,9 @@
 # -*- coding: utf-8 -*-
-# vaa_korea_mapped_composite_report.py
-# VAA 전략: EFA 대신 [유로스탁스50 + 일본니케이225] 합성 지수 사용 버전
-
+# vaa_korea_mapped_report_fdr.py
 import os
 from datetime import datetime
 import pandas as pd
-import numpy as np
-import FinanceDataReader as fdr
+import FinanceDataReader as fdr  # ✅ yfinance → FinanceDataReader
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side, NamedStyle
@@ -15,18 +12,18 @@ from openpyxl.utils import get_column_letter
 # =========================================================
 # 설정
 # =========================================================
-CONVERT_TO_KRW = True   # 미국 ETF 가격을 원화로 환산해 표기 (단, 국내 ETF 합성은 제외)
+CONVERT_TO_KRW = True   # 미국 ETF 가격을 원화로 환산해 표기 (USDKRW 월말환율)
 MIN_MONTHS = 13         # 12개월 비교(현재 포함)에 필요한 최소 월 스냅샷 수
 
 OUT_DIR = "vaa_out"
 
 # =========================================================
-# 의사결정 자산 구성 (EFA -> COMPOSITE_EU_JP 변경)
+# 의사결정(미국 ETF, 백데이터) 구성
 # =========================================================
 DECISION_ASSETS = [
-    # 분류, 의사결정기준(라벨), 티커(Key)
+    # 분류, 의사결정기준(라벨), 미국ETF 티커
     ["공격자산", "미국 주식SPY", "SPY"],
-    ["공격자산", "선진국(유로+일본)", "COMPOSITE_EU_JP"], # ✅ EFA 대체
+    ["공격자산", "선진국 주식EFA", "EFA"],
     ["공격자산", "개발도상국 주식EEM", "EEM"],
     ["공격자산", "미국 혼합채권AGG", "AGG"],
     ["안전자산", "미국 회사채LQD", "LQD"],
@@ -36,12 +33,11 @@ DECISION_ASSETS = [
 DECISION_DF = pd.DataFrame(DECISION_ASSETS, columns=["분류", "의사결정기준", "US_Ticker"])
 
 # =========================================================
-# 실제 투자(국내 ETF) 매핑
+# 실제 투자(국내 ETF, ISA) 매핑: 미국ETF → 국내ETF
 # =========================================================
 US_TO_KR_MAP = {
     "SPY":  {"종목명": "KODEX 미국S&P500",              "Code": "379800", "환율": "환노출"},
-    # ✅ 합성 지수 매핑 정보 (엑셀 표기용)
-    "COMPOSITE_EU_JP": {"종목명": "TIGER 유로50 / 일본225 (각 50%)", "Code": "195930 / 241180", "환율": "국내상장(KRW)"},
+    "EFA":  {"종목명": "KODEX MSCI선진국",              "Code": "251350", "환율": "환노출"},
     "EEM":  {"종목명": "PLUS 신흥국MSCI(합성 H)",          "Code": "195980", "환율": "환해지"},
     "AGG":  {"종목명": "KODEX iShares미국투자등급회사채 엑티브", "Code": "468630", "환율": "환노출"},
     "LQD":  {"종목명": "KODEX 미국종합채권ESG엑티브(H)", "Code": "437080", "환율": "환해지"},
@@ -52,7 +48,7 @@ US_TO_KR_MAP = {
 # (옵션) 프록시 – 특정 미국 ETF가 데이터 부족/이상일 때 대체
 PROXY_MAP = {
     "SPY": ["IVV", "VOO"],
-    # EFA 프록시는 제거 (합성 로직 사용)
+    "EFA": ["IEFA"],
     "EEM": ["VWO"],
     "AGG": ["BND"],
     "LQD": ["VCIT"],
@@ -61,9 +57,14 @@ PROXY_MAP = {
 }
 
 # =========================================================
-# 환율 (KRW per USD) 월말 시리즈
+# 환율 (KRW per USD) 월말 시리즈 (FinanceDataReader 사용)
 # =========================================================
 def _read_fx_usdkrw(start="2010-01-01") -> pd.Series:
+    """
+    FinanceDataReader는 USD/KRW 심볼이 설치/버전에 따라
+    'USD/KRW', 'USDKRW', 'USD-KRW' 등으로 다를 수 있어
+    몇 가지를 시도한다. Close 컬럼 사용.
+    """
     candidates = ["USD/KRW", "USDKRW", "USD-KRW"]
     last_err = None
     for sym in candidates:
@@ -71,25 +72,29 @@ def _read_fx_usdkrw(start="2010-01-01") -> pd.Series:
             fx = fdr.DataReader(sym, start)
             if not fx.empty and "Close" in fx:
                 s = fx["Close"].dropna()
+                # 일부 데이터프레임은 tz-aware가 아님. 그대로 사용.
                 return s.resample("M").last().dropna()
         except Exception as e:
             last_err = e
             continue
-    print(f"⚠️ 환율 데이터 로드 실패 (마지막 오류: {last_err}) - 환산 기능을 끕니다.")
-    global CONVERT_TO_KRW
-    CONVERT_TO_KRW = False
-    return pd.Series(dtype=float)
+    raise RuntimeError(f"환율(USD/KRW) 데이터를 불러오지 못했습니다. 마지막 오류: {last_err}")
 
 USDKRW_MONTHLY = _read_fx_usdkrw()
 
 # =========================================================
-# 데이터 핸들링 유틸리티
+# 데이터 핸들링
 # =========================================================
 def load_daily(ticker: str, start="2010-01-01") -> pd.DataFrame:
+    """
+    FinanceDataReader로 일봉 받기.
+    반환 컬럼: ['Open','High','Low','Close','Volume','Change'] (소스에 따라 다소 차이)
+    """
     try:
         df = fdr.DataReader(ticker, start)
+        # 컬럼 표준화: Close가 없으면 실패 처리
         if df is None or df.empty or "Close" not in df.columns:
             return pd.DataFrame()
+        # 인덱스가 DatetimeIndex가 아니면 변환 시도
         if not isinstance(df.index, pd.DatetimeIndex):
             df.index = pd.to_datetime(df.index)
         df = df.sort_index()
@@ -97,47 +102,11 @@ def load_daily(ticker: str, start="2010-01-01") -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-# ✅ [신규 함수] 유로+일본 합성 지수 생성기
-def load_composite_daily(start="2010-01-01") -> pd.DataFrame:
-    print(">> 합성 지수(유로+일본) 데이터 생성 중...")
-    try:
-        # TIGER 유로스탁스50(195930), TIGER 일본니케이225(241180)
-        df_eu = fdr.DataReader("195930", start)
-        df_jp = fdr.DataReader("241180", start)
-
-        if df_eu.empty or df_jp.empty:
-            return pd.DataFrame()
-
-        # 종가 시리즈 추출
-        s_eu = df_eu['Close']
-        s_jp = df_jp['Close']
-
-        # 날짜 교집합 (데이터 정렬)
-        idx = s_eu.index.intersection(s_jp.index)
-        s_eu = s_eu.loc[idx]
-        s_jp = s_jp.loc[idx]
-
-        # 일간 변동률 계산
-        ret_eu = s_eu.pct_change().fillna(0)
-        ret_jp = s_jp.pct_change().fillna(0)
-
-        # 50:50 합성 수익률
-        ret_composite = (ret_eu * 0.5) + (ret_jp * 0.5)
-
-        # 지수화 (기준일 1,000pt 시작 가정)
-        composite_idx = (1 + ret_composite).cumprod() * 1000.0
-        
-        # DataFrame 형태로 반환 (fdr 포맷과 맞춤)
-        return pd.DataFrame({"Close": composite_idx}, index=idx)
-
-    except Exception as e:
-        print(f"❌ 합성 지수 생성 실패: {e}")
-        return pd.DataFrame()
-
-def monthly_with_current(df: pd.DataFrame, is_krw_asset: bool = False) -> pd.Series:
+def monthly_with_current(df: pd.DataFrame) -> pd.Series:
     """
     일봉 → 월말 종가 + 현재(오늘) 종가 보강.
-    is_krw_asset=True이면 환율 곱셈을 건너뜀 (이미 KRW).
+    CONVERT_TO_KRW=True 이면 월별 환율(USDKRW) 곱해 KRW Series로 변환.
+    항상 float Series 반환.
     """
     if df is None or df.empty or "Close" not in df:
         return pd.Series(dtype="float64")
@@ -148,14 +117,14 @@ def monthly_with_current(df: pd.DataFrame, is_krw_asset: bool = False) -> pd.Ser
 
     monthly = close.resample("M").last().dropna()
 
-    # 현재 종가 보강
+    # 현재 종가 보강(해당 월 스냅샷이 없을 때만 마지막 값을 추가)
     last_date = close.index[-1]
     last_close = float(close.iloc[-1])
     if len(monthly) == 0 or (monthly.index[-1].month != last_date.month or monthly.index[-1].year != last_date.year):
         monthly = pd.concat([monthly, pd.Series([last_close], index=[last_date])])
 
-    # KRW 환산 (이미 원화자산이 아니고, 변환 옵션이 켜져있을 때만)
-    if CONVERT_TO_KRW and not is_krw_asset:
+    # KRW 환산
+    if CONVERT_TO_KRW:
         fx = USDKRW_MONTHLY.reindex(monthly.index, method="ffill")
         if isinstance(fx, pd.DataFrame):
             fx = fx.iloc[:, 0]
@@ -167,14 +136,26 @@ def monthly_with_current(df: pd.DataFrame, is_krw_asset: bool = False) -> pd.Ser
 
 def snapshot_momentum(monthly: pd.Series):
     """
-    스냅샷 모멘텀 계산
+    스냅샷 모멘텀: r_k = P0/Pk - 1
+    score_raw = 12*r1 + 4*r3 + 2*r6 + 1*r12   (비율)
+    score_pct = score_raw * 100                (퍼센트)
+    반환: r1,r3,r6,r12(비율), score_pct(퍼센트), P0,P1,P3,P6,P12(가격)
     """
     if monthly is None or len(monthly) < MIN_MONTHS:
         raise ValueError("월말 시리즈가 부족합니다.")
 
     def _scalar(x):
-        try: return float(x.item())
-        except: return float(x)
+        if hasattr(x, "item"):
+            try:
+                return float(x.item())
+            except Exception:
+                pass
+        try:
+            return float(x)
+        except Exception:
+            if isinstance(x, pd.Series):
+                return float(x.iloc[0])
+            raise
 
     P0  = _scalar(monthly.iloc[-1])   # 현재
     P1  = _scalar(monthly.iloc[-2])   # 1개월 전
@@ -188,53 +169,48 @@ def snapshot_momentum(monthly: pd.Series):
     r12 = P0 / P12 - 1.0
 
     score_raw = 12*r1 + 4*r3 + 2*r6 + 1*r12
-    score_pct = score_raw # (기존 코드 로직 유지)
+    # score_pct = score_raw * 100.0
+    score_pct = score_raw
 
     return r1, r3, r6, r12, score_pct, P0, P1, P3, P6, P12
 
-def resolve_with_proxy(ticker_key: str):
+def resolve_with_proxy(us_ticker: str):
     """
-    티커 키에 따라 데이터를 로드.
-    - COMPOSITE_EU_JP: 합성 데이터 로드 (환율 적용 X)
-    - 그 외: 미국 ETF 로드 (환율 적용 O)
+    미국 ETF ticker로 월 스냅샷 생성.
+    필요시 PROXY_MAP을 이용해 대체.
+    (모두 FinanceDataReader 사용)
     """
-    # 1. 특수 케이스: 유로+일본 합성
-    if ticker_key == "COMPOSITE_EU_JP":
-        df = load_composite_daily()
-        # 합성 지수는 이미 KRW 기반이므로 is_krw_asset=True
-        monthly = monthly_with_current(df, is_krw_asset=True)
-        if len(monthly) >= MIN_MONTHS:
-            return ticker_key, "합성(KRW)", *snapshot_momentum(monthly)
-        else:
-            return ticker_key, "데이터부족", None, None, None, None, None, None, None, None, None, None
-
-    # 2. 일반 케이스 (미국 ETF)
-    # 원본 티커 시도
-    df = load_daily(ticker_key)
-    monthly = monthly_with_current(df, is_krw_asset=False)
+    df = load_daily(us_ticker)
+    monthly = monthly_with_current(df)
     if len(monthly) >= MIN_MONTHS:
-        return ticker_key, "원본", *snapshot_momentum(monthly)
+        return us_ticker, "원본", *snapshot_momentum(monthly)
 
-    # 프록시 시도
-    for p in PROXY_MAP.get(ticker_key, []):
+    for p in PROXY_MAP.get(us_ticker, []):
         dfp = load_daily(p)
-        monthly_p = monthly_with_current(dfp, is_krw_asset=False)
+        monthly_p = monthly_with_current(dfp)
         if len(monthly_p) >= MIN_MONTHS:
             return p, f"대체[{p}]", *snapshot_momentum(monthly_p)
 
-    return ticker_key, "데이터없음", None, None, None, None, None, None, None, None, None, None
+    return us_ticker, "데이터없음", None, None, None, None, None, None, None, None, None, None
 
 # =========================================================
 # 계산 & 결정
 # =========================================================
 def build_summary_df():
+    """
+    Summary DataFrame:
+    [분류, 의사결정기준, US_Ticker, 사용티커, 데이터출처,
+     실제투자_종목명, 실제투자_Code, 실제투자_환율,
+     1/3/6/12개월(%), 모멘텀점수(가중합,%),
+     현재/1/3/6/12개월 가격(KRW)]
+    """
     rows = []
     for _, r in DECISION_DF.iterrows():
         group, label, us_ticker = r["분류"], r["의사결정기준"], r["US_Ticker"]
 
         used_ticker, src, r1, r3, r6, r12, score_pct, P0, P1, P3, P6, P12 = resolve_with_proxy(us_ticker)
 
-        # 국내 투자 종목 매핑
+        # 국내 투자 종목 매핑 (표시에만 사용)
         kr_map = US_TO_KR_MAP.get(us_ticker, {"종목명": None, "Code": None, "환율": None})
 
         rows.append([
@@ -256,15 +232,20 @@ def build_summary_df():
     ])
 
 def decision_banner(summary_df: pd.DataFrame) -> str:
+    """
+    규칙:
+    - 공격 4개(SPY,EFA,EEM,AGG)의 모멘텀점수 모두 > 0 → 그중 최고점의 국내 ETF에 투자
+    - 아니면 안전(LQD, IEF, SHY)에서 최고점의 국내 ETF에 투자
+    """
     aggr = summary_df[summary_df["분류"]=="공격자산"].copy()
     safe = summary_df[summary_df["분류"]=="안전자산"].copy()
 
-    # 공격자산 4개가 모두 모멘텀 > 0 인지 체크
     if all((aggr["모멘텀점수(가중합,%)"] > 0).fillna(False)):
         tgt = aggr.loc[aggr["모멘텀점수(가중합,%)"].idxmax()]
     else:
         tgt = safe.loc[safe["모멘텀점수(가중합,%)"].idxmax()]
 
+    # 배너: 국내 실제 투자 종목과 코드 표시 + (의사결정기준)
     return f"이번달 투자 대상: {tgt['실제투자_종목명']} ({tgt['실제투자_Code']})  —  기준: {tgt['의사결정기준']} / {tgt['US_Ticker']}"
 
 # =========================================================
@@ -286,6 +267,7 @@ def write_summary_sheet(wb: Workbook, df: pd.DataFrame, month_str: str):
     thin = Side(style="thin", color="D9D9D9")
     border_all = Border(left=thin, right=thin, top=thin, bottom=thin)
 
+    # Styles
     if "percent_style" not in wb.named_styles:
         st = NamedStyle(name="percent_style"); st.number_format = "0.00%"; wb.add_named_style(st)
     if "won_style" not in wb.named_styles:
@@ -293,7 +275,7 @@ def write_summary_sheet(wb: Workbook, df: pd.DataFrame, month_str: str):
 
     # Banner
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(df.columns))
-    c = ws.cell(row=1, column=1, value=f"VAA Summary (EFA대체: 유로/일본 합성) — {month_str}")
+    c = ws.cell(row=1, column=1, value=f"VAA Summary — {month_str} (가격단위: {'KRW' if CONVERT_TO_KRW else 'USD'})")
     c.font = Font(size=14, bold=True); c.fill = title_fill
     c.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 24
@@ -335,7 +317,7 @@ def write_detail_sheet(wb: Workbook, df: pd.DataFrame, banner: str, month_str: s
 
     # Title
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=12)
-    c = ws.cell(row=1, column=1, value=f"VAA Detail (가격단위: KRW) — {month_str}")
+    c = ws.cell(row=1, column=1, value=f"VAA Detail — {month_str} (가격단위: {'KRW' if CONVERT_TO_KRW else 'USD'})")
     c.font = Font(size=14, bold=True); c.fill = title_fill
     c.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 24
@@ -345,14 +327,16 @@ def write_detail_sheet(wb: Workbook, df: pd.DataFrame, banner: str, month_str: s
 
     def add_block(ar):
         nonlocal row_cursor
+        # 상단 정보
         ws.cell(row=row_cursor, column=1, value="의사결정기준"); ws.cell(row=row_cursor, column=2, value=f"{ar['의사결정기준']} / {ar['US_Ticker']}"); row_cursor += 1
         ws.cell(row=row_cursor, column=1, value="실제 투자");   ws.cell(row=row_cursor, column=2, value=f"{ar['실제투자_종목명']} ({ar['실제투자_Code']})"); row_cursor += 1
         ws.cell(row=row_cursor, column=1, value="환율표기");   ws.cell(row=row_cursor, column=2, value=ar["실제투자_환율"]); row_cursor += 1
         ws.cell(row=row_cursor, column=1, value="모멘텀 스코어")
-        sc = ws.cell(row=row_cursor, column=2, value=(ar["모멘텀점수(가중합,%)"] if pd.notna(ar["모멘텀점수(가중합,%)"]) else None))
+        sc = ws.cell(row=row_cursor, column=2, value=(ar["모멘텀점수(가중합,%)"]/100.0 if pd.notna(ar["모멘텀점수(가중합,%)"]) else None))
         sc.number_format = "0.00"; row_cursor += 1
         row_cursor += 1
 
+        # 표 헤더
         headers = ["구간","현재","1개월 전","3개월 전","6개월 전","12개월 전"]
         for col, h in enumerate(headers, start=1):
             cell = ws.cell(row=row_cursor, column=col, value=h)
@@ -360,6 +344,7 @@ def write_detail_sheet(wb: Workbook, df: pd.DataFrame, banner: str, month_str: s
             cell.alignment = Alignment(horizontal="center"); cell.border = border_all
         row_cursor += 1
 
+        # 가격
         price_row = ["가격", ar["현재가격(KRW)"], ar["1개월전(KRW)"], ar["3개월전(KRW)"], ar["6개월전(KRW)"], ar["12개월전(KRW)"]]
         for col, v in enumerate(price_row, start=1):
             cell = ws.cell(row=row_cursor, column=col, value=v)
@@ -367,6 +352,7 @@ def write_detail_sheet(wb: Workbook, df: pd.DataFrame, banner: str, month_str: s
             if col > 1 and isinstance(v, (int, float)): cell.style = "won_style"
         row_cursor += 1
 
+        # 수익률
         r_row = ["각 구간 수익률", None, ar["1개월(%)"], ar["3개월(%)"], ar["6개월(%)"], ar["12개월(%)"]]
         for col, v in enumerate(r_row, start=1):
             if col <= 2:
@@ -377,11 +363,13 @@ def write_detail_sheet(wb: Workbook, df: pd.DataFrame, banner: str, month_str: s
             cell.border = border_all
         row_cursor += 1
 
+        # 배수
         mult_row = ["각 구간 배수", None, 12, 4, 2, 1]
         for col, v in enumerate(mult_row, start=1):
             cell = ws.cell(row=row_cursor, column=col, value=v); cell.border = border_all
         row_cursor += 1
 
+        # 각 스코어(비율→% 표시)
         s1  = None if pd.isna(ar["1개월(%)"]) else ar["1개월(%)"] * 12 / 100.0
         s3  = None if pd.isna(ar["3개월(%)"]) else ar["3개월(%)"] * 4  / 100.0
         s6  = None if pd.isna(ar["6개월(%)"]) else ar["6개월(%)"] * 2  / 100.0
@@ -393,12 +381,15 @@ def write_detail_sheet(wb: Workbook, df: pd.DataFrame, banner: str, month_str: s
             if col > 2 and v is not None: cell.number_format = "0.00"
         row_cursor += 1
 
+        # 합계
         for col in range(1, 6):
             cell = ws.cell(row=row_cursor, column=col, value=""); cell.border = border_all
+        # tot = ws.cell(row=row_cursor, column=6, value=(ar["모멘텀점수(가중합,%)"]/100.0 if pd.notna(ar["모멘텀점수(가중합,%)"]) else None))
         tot = ws.cell(row=row_cursor, column=6, value=(ar["모멘텀점수(가중합,%)"] if pd.notna(ar["모멘텀점수(가중합,%)"]) else None))
         tot.number_format = "0.00"; tot.border = border_all
         row_cursor += 2
 
+    # 공격 → 안전 순서대로 출력
     for grp in ["공격자산","안전자산"]:
         sub = df[df["분류"]==grp]
         if sub.empty: continue
@@ -416,7 +407,7 @@ def write_detail_sheet(wb: Workbook, df: pd.DataFrame, banner: str, month_str: s
 def main():
     month_str = datetime.now().strftime("%Y-%m")
     os.makedirs(OUT_DIR, exist_ok=True)
-    xlsx_path = os.path.join(OUT_DIR, f"vaa_composite_report_{month_str}.xlsx")
+    xlsx_path = os.path.join(OUT_DIR, f"vaa_report_{month_str}.xlsx")
 
     summary = build_summary_df()
     banner  = decision_banner(summary)

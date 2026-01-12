@@ -1,23 +1,35 @@
-import FinanceDataReader as fdr
+import pyupbit
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
+import time
 
-def export_turtle_final_v2(ticker_symbol, total_capital):
-    print(f"[{ticker_symbol}] 터틀 트레이딩 분석(매수금액 포함) 생성 중... (자본금: {total_capital:,}원)")
+def export_turtle_upbit_full_chart(ticker_symbol, total_capital):
+    # 1. 티커 변환 및 초기 설정
+    if "/" in ticker_symbol:
+        coin = ticker_symbol.split("/")[0].upper()
+        upbit_ticker = f"KRW-{coin}"
+    else:
+        upbit_ticker = ticker_symbol.upper() # 이미 KRW-BTC 형식이거나 BTC만 입력한 경우
+
+    print(f"\n>> [{ticker_symbol}] (업비트 기준: {upbit_ticker}) 분석 시작... (자본금: {total_capital:,}원)")
     
-    # 1. 데이터 가져오기
-    start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+    # 2. 데이터 가져오기 (pyupbit)
     try:
-        df = fdr.DataReader(ticker_symbol, start=start_date)
-        if df.empty:
-            print("데이터를 찾을 수 없습니다.")
+        df = pyupbit.get_ohlcv(upbit_ticker, interval="day", count=200)
+        
+        if df is None or df.empty:
+            print(f"❌ 데이터를 찾을 수 없습니다. 티커를 확인해주세요. ({upbit_ticker})")
             return
+            
+        # 컬럼명 대문자 변환 (Open, High, Low, Close, Volume)
+        df.columns = ['Open', 'High', 'Low', 'Close', 'Volume', 'Value']
+        
     except Exception as e:
-        print(f"오류 발생: {e}")
+        print(f"❌ 오류 발생: {e}")
         return
 
-    # 2. TR 계산 및 구성요소 분리
+    # 3. TR 계산
     df['Prev Close'] = df['Close'].shift(1)
     df.dropna(inplace=True)
 
@@ -26,7 +38,7 @@ def export_turtle_final_v2(ticker_symbol, total_capital):
     df['TR3_C'] = df['High'] - df['Low']
     df['TR'] = df[['TR1_A', 'TR2_B', 'TR3_C']].max(axis=1)
 
-    # 3. 이동평균 계산 (SMA, MMA, EMA)
+    # 4. 이동평균 (SMA, MMA, EMA)
     tr_values = df['TR'].values
     n_days = len(tr_values)
     period = 20
@@ -36,10 +48,10 @@ def export_turtle_final_v2(ticker_symbol, total_capital):
     ema_values = np.zeros(n_days)
     
     if n_days < period:
-        print("데이터 부족")
+        print("❌ 데이터 부족 (최소 20일 이상 필요)")
         return
 
-    # SMA 계산
+    # SMA
     sma_series = df['TR'].rolling(window=period).mean()
     sma_values = sma_series.fillna(0).values
 
@@ -48,7 +60,7 @@ def export_turtle_final_v2(ticker_symbol, total_capital):
     mma_values[period-1] = first_seed
     ema_values[period-1] = first_seed
 
-    # MMA, EMA 재귀적 계산
+    # 재귀적 계산
     for i in range(period, n_days):
         current_tr = tr_values[i]
         mma_values[i] = (mma_values[i-1] * 19 + current_tr) / 20
@@ -61,16 +73,17 @@ def export_turtle_final_v2(ticker_symbol, total_capital):
     # 앞쪽 NaN 처리
     df.loc[df.index[:period-1], ['ATR_MMA_20', 'ATR_EMA_20']] = np.nan
 
-    # 4. 엑셀 출력용 데이터 정리
+    # 5. 엑셀 데이터 정리
     cols = ['Close', 'TR1_A', 'TR2_B', 'TR3_C', 'TR', 'ATR_SMA_20', 'ATR_MMA_20', 'ATR_EMA_20']
     output_df = df[cols].copy()
     output_df = output_df.tail(60)
     
     int_cols = ['TR1_A', 'TR2_B', 'TR3_C', 'TR', 'ATR_SMA_20', 'ATR_MMA_20', 'ATR_EMA_20']
     output_df[int_cols] = output_df[int_cols].fillna(0).round().astype(int)
+    output_df['Close'] = output_df['Close'].fillna(0).round().astype(int)
     output_df.index = output_df.index.strftime('%Y.%m.%d')
 
-    # 5. 매수 수량 및 금액 계산
+    # 6. 매수 수량 및 금액 (소수점 지원)
     current_price = int(output_df['Close'].iloc[-1])
     current_atr = int(output_df['ATR_EMA_20'].iloc[-1])
     if current_atr <= 0: current_atr = 1
@@ -79,49 +92,41 @@ def export_turtle_final_v2(ticker_symbol, total_capital):
     risk_amt_2pct = total_capital * 0.02
     stop_loss = current_price - (2 * current_atr)
 
-    # 계산 함수 (수량, 금액)
     def calc_qty_amt(risk_money, divisor_atr):
-        qty = int(risk_money / divisor_atr)
-        amt = qty * current_price
+        qty = risk_money / divisor_atr 
+        amt = qty * current_price       
         return qty, amt
 
-    # Case 1: 1N 나누기 (정석)
     qty_1n_1pct, amt_1n_1pct = calc_qty_amt(risk_amt_1pct, current_atr)
     qty_1n_2pct, amt_1n_2pct = calc_qty_amt(risk_amt_2pct, current_atr)
-
-    # Case 2: 2N 나누기 (보수적)
     qty_2n_1pct, amt_2n_1pct = calc_qty_amt(risk_amt_1pct, 2 * current_atr)
     qty_2n_2pct, amt_2n_2pct = calc_qty_amt(risk_amt_2pct, 2 * current_atr)
 
     # -------------------------------------------------------
-    # 6. 엑셀 저장
+    # 7. 엑셀 저장 및 차트 그리기
     # -------------------------------------------------------
-    file_name = f"[ST&ETF]{ticker_symbol}.xlsx"
-    writer = pd.ExcelWriter(file_name, engine='xlsxwriter')
+    safe_ticker = upbit_ticker.replace("-", "_")
+    file_name = f"[Cripto]{safe_ticker}.xlsx"
     
-    # 상단 표가 길어졌으므로 시작 행을 조금 더 아래로 조정 (15행부터 데이터)
+    writer = pd.ExcelWriter(file_name, engine='xlsxwriter')
     start_row = 14
     output_df.to_excel(writer, sheet_name='Sheet1', startrow=start_row)
 
     workbook  = writer.book
     worksheet = writer.sheets['Sheet1']
 
-    # 포맷 정의
+    # 포맷 설정
     fmt_title = workbook.add_format({'bold': True, 'font_size': 14, 'align': 'center'})
     fmt_head  = workbook.add_format({'bold': True, 'bg_color': '#DDEBF7', 'border': 1, 'align': 'center', 'valign': 'vcenter'})
     fmt_val   = workbook.add_format({'border': 1, 'num_format': '#,##0', 'align': 'center', 'valign': 'vcenter'})
     
-    # 스타일 (초록: 1% 정석 / 노랑: 2% 공격적)
-    fmt_std_qty   = workbook.add_format({'bold': True, 'bg_color': '#E2EFDA', 'border': 1, 'num_format': '#,##0', 'align': 'center'})
-    fmt_std_amt   = workbook.add_format({'bg_color': '#E2EFDA', 'border': 1, 'num_format': '#,##0', 'align': 'center', 'font_color': '#548235'}) # 금액은 약간 연하게
-    
-    fmt_agg_qty  = workbook.add_format({'bold': True, 'bg_color': '#FFF2CC', 'border': 1, 'num_format': '#,##0', 'align': 'center'})
-    fmt_agg_amt  = workbook.add_format({'bg_color': '#FFF2CC', 'border': 1, 'num_format': '#,##0', 'align': 'center', 'font_color': '#BF8F00'})
+    fmt_std_qty = workbook.add_format({'bold': True, 'bg_color': '#E2EFDA', 'border': 1, 'align': 'center', 'num_format': '0.0000'})
+    fmt_std_amt = workbook.add_format({'bg_color': '#E2EFDA', 'border': 1, 'num_format': '#,##0', 'align': 'center', 'font_color': '#548235'})
+    fmt_agg_qty = workbook.add_format({'bold': True, 'bg_color': '#FFF2CC', 'border': 1, 'align': 'center', 'num_format': '0.0000'})
+    fmt_agg_amt = workbook.add_format({'bg_color': '#FFF2CC', 'border': 1, 'num_format': '#,##0', 'align': 'center', 'font_color': '#BF8F00'})
 
-    # --- 상단 요약 ---
-    worksheet.merge_range('A1:H1', f"🐢 터틀 트레이딩 종합 리포트 ({ticker_symbol})", fmt_title)
-
-    # 기본 정보
+    # 상단 요약
+    worksheet.merge_range('A1:H1', f"🐢 업비트 터틀 리포트 ({upbit_ticker})", fmt_title)
     worksheet.write(2, 0, "총 투자금", fmt_head)
     worksheet.write(2, 1, total_capital, fmt_val)
     worksheet.write(2, 2, "현재가", fmt_head)
@@ -131,49 +136,36 @@ def export_turtle_final_v2(ticker_symbol, total_capital):
     worksheet.write(2, 6, "손절가", fmt_head)
     worksheet.write(2, 7, stop_loss, fmt_val)
 
-    # --- 핵심 비교 표 (수량 & 금액) ---
-    # [수정된 부분] 헤더 행과 내용 행의 위치 충돌 해결
-    
-    # 1. 헤더 (Row 4 / 엑셀 5행)
-    worksheet.write(4, 0, "구분 (공식)", fmt_head) # A5
-    worksheet.write(4, 1, "1% 리스크 (정석)", fmt_head) # B5
-    worksheet.write(4, 2, "2% 리스크 (공격적)", fmt_head) # C5
+    # 테이블
+    worksheet.write(4, 0, "구분 (공식)", fmt_head)
+    worksheet.write(4, 1, "1% 리스크 (정석)", fmt_head)
+    worksheet.write(4, 2, "2% 리스크 (공격적)", fmt_head)
 
-    # 2. Row 1: 방식 1 (Row 5~6 / 엑셀 6~7행 병합)
     worksheet.merge_range('A6:A7', "방식 1: 나누기 1N\n(손절 시 2% 타격)", fmt_head)
-    
-    # 값 채우기 (방식 1)
-    worksheet.write(5, 1, f"수량: {qty_1n_1pct:,} 주", fmt_std_qty)
-    worksheet.write(6, 1, f"금액: {amt_1n_1pct:,} 원", fmt_std_amt)
-    
-    worksheet.write(5, 2, f"수량: {qty_1n_2pct:,} 주", fmt_agg_qty)
-    worksheet.write(6, 2, f"금액: {amt_1n_2pct:,} 원", fmt_agg_amt)
+    worksheet.write(5, 1, f"수량: {qty_1n_1pct:.4f} 개", fmt_std_qty)
+    worksheet.write(6, 1, f"금액: {int(amt_1n_1pct):,} 원", fmt_std_amt)
+    worksheet.write(5, 2, f"수량: {qty_1n_2pct:.4f} 개", fmt_agg_qty)
+    worksheet.write(6, 2, f"금액: {int(amt_1n_2pct):,} 원", fmt_agg_amt)
 
-    # 3. Row 2: 방식 2 (Row 7~8 / 엑셀 8~9행 병합)
     worksheet.merge_range('A8:A9', "방식 2: 나누기 2N\n(손절 시 1% 타격)", fmt_head)
-    
-    # 값 채우기 (방식 2)
-    worksheet.write(7, 1, f"수량: {qty_2n_1pct:,} 주", fmt_std_qty)
-    worksheet.write(8, 1, f"금액: {amt_2n_1pct:,} 원", fmt_std_amt)
-    
-    worksheet.write(7, 2, f"수량: {qty_2n_2pct:,} 주", fmt_agg_qty)
-    worksheet.write(8, 2, f"금액: {amt_2n_2pct:,} 원", fmt_agg_amt)
+    worksheet.write(7, 1, f"수량: {qty_2n_1pct:.4f} 개", fmt_std_qty)
+    worksheet.write(8, 1, f"금액: {int(amt_2n_1pct):,} 원", fmt_std_amt)
+    worksheet.write(7, 2, f"수량: {qty_2n_2pct:.4f} 개", fmt_agg_qty)
+    worksheet.write(8, 2, f"금액: {int(amt_2n_2pct):,} 원", fmt_agg_amt)
 
-    # 컬럼 너비 조정
     worksheet.set_column('A:A', 20) 
-    worksheet.set_column('B:C', 22) # 금액이 길어지므로 넓게
+    worksheet.set_column('B:C', 24) 
     worksheet.set_column('D:I', 11)
 
-    # -------------------------------------------------------
-    # 차트 (위치는 start_row + 데이터 길이 고려)
-    # -------------------------------------------------------
+    # --------------------------------------------------------------------------
+    # ★ 수정된 차트 부분 (TR, MMA 포함)
+    # --------------------------------------------------------------------------
     data_start = start_row + 1
     data_end = start_row + len(output_df)
 
-    # 차트 1: 주가 (최소값 적용)
+    # 1. 가격 차트
     min_close = output_df['Close'].min()
     y_min = min_close * 0.99 
-
     price_chart = workbook.add_chart({'type': 'line'})
     price_chart.add_series({
         'name':       'Close',
@@ -181,24 +173,24 @@ def export_turtle_final_v2(ticker_symbol, total_capital):
         'values':     ['Sheet1', data_start, 1, data_end, 1],
         'line':       {'color': '#4472C4', 'width': 2.0},
     })
-    price_chart.set_title({'name': f'{ticker_symbol} Price Trend'})
+    price_chart.set_title({'name': f'{upbit_ticker} Price Trend'})
     price_chart.set_y_axis({'min': y_min, 'major_gridlines': {'visible': True}})
     price_chart.set_x_axis({'visible': False})
     price_chart.set_size({'width': 800, 'height': 300})
     worksheet.insert_chart('J2', price_chart)
 
-    # 차트 2: ATR (TR 변동량 + SMA, MMA, EMA)
+    # 2. ATR 차트 (TR, SMA, MMA, EMA 모두 추가)
     atr_chart = workbook.add_chart({'type': 'line'})
     
-    # 1. TR (Daily Raw) - 회색 얇은 선
+    # [추가됨] (1) Daily TR (회색 얇은 선) - 5번째 컬럼(F열)
     atr_chart.add_series({
         'name':       'Daily TR',
         'categories': ['Sheet1', data_start, 0, data_end, 0], 
         'values':     ['Sheet1', data_start, 5, data_end, 5], 
-        'line':       {'color': '#BFBFBF', 'width': 1.0},
+        'line':       {'color': '#D9D9D9', 'width': 1.0}, # 연한 회색
     })
     
-    # 2. SMA 20 - 녹색 점선
+    # (2) SMA 20 (녹색 점선) - 6번째 컬럼
     atr_chart.add_series({
         'name':       'SMA 20',
         'categories': ['Sheet1', data_start, 0, data_end, 0], 
@@ -206,7 +198,7 @@ def export_turtle_final_v2(ticker_symbol, total_capital):
         'line':       {'color': '#00B050', 'width': 1.5, 'dash_type': 'dash'},
     })
 
-    # 3. MMA 20 - 파란색 실선
+    # [추가됨] (3) MMA 20 (파란색 실선) - 7번째 컬럼
     atr_chart.add_series({
         'name':       'MMA 20',
         'categories': ['Sheet1', data_start, 0, data_end, 0], 
@@ -214,7 +206,7 @@ def export_turtle_final_v2(ticker_symbol, total_capital):
         'line':       {'color': '#0070C0', 'width': 1.5},
     })
 
-    # 4. EMA 20 - 빨간색 굵은 실선
+    # (4) EMA 20 (빨간색 굵은 선) - 8번째 컬럼
     atr_chart.add_series({
         'name':       'EMA 20',
         'categories': ['Sheet1', data_start, 0, data_end, 0], 
@@ -222,21 +214,42 @@ def export_turtle_final_v2(ticker_symbol, total_capital):
         'line':       {'color': '#FF0000', 'width': 2.5},
     })
 
-    atr_chart.set_title({'name': 'Volatility Analysis (TR, SMA, MMA, EMA)'})
+    atr_chart.set_title({'name': 'Volatility (Daily TR vs SMA, MMA, EMA)'})
     atr_chart.set_size({'width': 800, 'height': 350})
     worksheet.insert_chart('J18', atr_chart)
 
     writer.close()
-    print(f"완료! '{file_name}' 생성됨.")
+    print(f"✅ 완료! '{file_name}' 생성됨.")
 
 # --- 메인 실행부 ---
 if __name__ == "__main__":
-    try:
-        t_ticker = input("종목 코드 입력 (예: 005930, BTC-USD): ")
-        t_capital_str = input("총 투자금액 입력 (예: 10000000): ")
-        t_capital = int(t_capital_str.replace(",", ""))
+    print("==================================================")
+    print("🐢 업비트 터틀 리포트 (TR/MMA 차트 포함 버전)")
+    print("==================================================")
+    
+    user_capital = 0
+    while True:
+        cap_input = input("\n💰 총 투자금액 입력 (예: 4000000) [종료: q]: ").strip().replace(",", "")
+        if cap_input.lower() == 'q': exit()
+        if cap_input.isdigit():
+            user_capital = int(cap_input)
+            break
+        else:
+            print("⚠️ 숫자로만 입력해주세요.")
+
+    while True:
+        print(f"\n--------------------------------------------------")
+        print(f"현재 설정된 투자금: {user_capital:,}원")
+        ticker = input("📈 코인 심볼 입력 (예: BTC/KRW 또는 BTC) [종료: q]: ").strip()
         
-        if t_ticker and t_capital:
-            export_turtle_final_v2(t_ticker, t_capital)
-    except ValueError:
-        print("금액은 숫자로만 입력해주세요.")
+        if ticker.lower() in ['q', 'quit', 'exit']:
+            print("종료합니다.")
+            break
+        
+        if not ticker: continue
+        
+        # BTC 입력시 자동 변환
+        if "/" not in ticker and "-" not in ticker:
+            ticker = f"{ticker}/KRW"
+
+        export_turtle_upbit_full_chart(ticker, user_capital)

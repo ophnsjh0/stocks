@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
-# dualmomentom_returns_report.py
-# - 듀얼모멘텀(미국 ETF로 의사결정 → 국내 ETF로 실행)
-# - EFA 매핑: KODEX MSCI선진국(251350) 단일
-# - 비교 시트: EFA vs 251350 (12/24/36M 상관, 추적차, 거래량)
+# dualmomentom_isa_alternative3.py
+# -----------------------------------------------------------------------------
+# [대안 3] 완벽 일치형 듀얼모멘텀 (ISA 계좌 전용)
+# - 의사결정: SPY(미국) vs [TIGER 유로스탁스50 + TIGER 일본니케이225 합성](선진국)
+# - 실행: 국내 상장 해외 ETF (ISA 거래 가능)
+# -----------------------------------------------------------------------------
 
 import os
 from datetime import datetime
@@ -15,408 +17,265 @@ from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 
 # =========================
-# 기본 설정
+# 1. 설정 (ISA 포트폴리오)
 # =========================
-OUT_DIR = "dual_momentum_out"
+OUT_DIR = "dual_momentum_isa"
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# =========================
-# 백데이터(의사결정) 티커
-# =========================
-US_TICKERS = {
-    "SPY": "미국 주식SPY",
-    "EFA": "선진국 주식EFA",
-    "BIL": "초단기채권BIL",
-    "AGG": "미국 혼합채권AGG",  # fallback
+# 1) 의사결정용 티커 (야후 파이낸스 기준)
+# - 미국 대표: SPY (데이터 역사가 길어서 판단용으로 적합)
+# - 현금/채권: BIL (초단기채, 수비 기준)
+# - 선진국(비미국): EFA 대신 실제 투자할 '국내 ETF' 데이터를 직접 사용 (괴리 제거)
+TICKER_DECISION = {
+    "US": "SPY",            # 미국 주식 판단
+    "CASH": "BIL",          # 현금성 자산 판단 (절대모멘텀 기준)
+    "EU_ETF": "195930.KS",  # TIGER 유로스탁스50(합성 H)
+    "JP_ETF": "241180.KS"   # TIGER 일본니케이225
+}
+
+# 2) 실제 매수할 종목 (ISA 계좌용 국내상장 ETF)
+# - 당첨된 자산군에 따라 매수할 종목 리스트
+ALLOCATION_MAP = {
+    "US_WIN": [
+        {"지역": "미국", "종목명": "TIGER 미국S&P500", "Code": "360750", "비중": 1.0}
+    ],
+    "NON_US_WIN": [
+        {"지역": "유럽", "종목명": "TIGER 유로스탁스50(합성 H)", "Code": "195930", "비중": 0.5},
+        {"지역": "일본", "종목명": "TIGER 일본니케이225", "Code": "241180", "비중": 0.5}
+    ],
+    "DEFENSIVE": [
+        {"지역": "채권", "종목명": "KODEX 미국종합채권SRI액티브(H)", "Code": "437080", "비중": 1.0}
+    ]
 }
 
 # =========================
-# 실제 투자 매핑 (국내 ETF)
+# 2. 데이터 유틸리티
 # =========================
-KR_MAPPING = {
-    "SPY": [
-        {"분류": "미국",   "종목명": "KODEX 미국S&P500",                 "Code": "379800", "환율": "환해지", "비중(%)": 100.0},
-    ],
-    "EFA": [
-        # ✅ 변경: EFA는 KODEX MSCI선진국(251350) 단일 매핑
-        {"분류": "선진국", "종목명": "KODEX MSCI선진국",                 "Code": "251350", "환율": "환노출", "비중(%)": 100.0},
-    ],
-    "AGG": [
-        {"분류": "채권",   "종목명": "KODEX 미국종합채권SRI액티브(H)",   "Code": "437080", "환율": "환노출", "비중(%)": 100.0},
-    ],
-}
-
-# 국내 ETF 코드 목록 (Returns 시트 계산용)
-KR_CODES = ["379800", "251350", "437080"]
-
-
-# =========================
-# 유틸
-# =========================
-def ensure_series(x: pd.Series | pd.DataFrame) -> pd.Series:
-    """Close 등에서 뽑은 뒤에도 가끔 DataFrame이 남는 케이스 방지: 1열 Series 강제."""
-    if isinstance(x, pd.DataFrame):
-        return x.iloc[:, 0].astype(float)
-    return x.astype(float)
-
-def monthly_close(ticker: str, start="2010-01-01") -> pd.Series:
-    """야후에서 받아 월말 종가 Series로 반환."""
-    df = yf.download(ticker, start=start, progress=False)
-    if df.empty or "Close" not in df:
-        raise RuntimeError(f"{ticker} 데이터가 비어 있습니다.")
-    m = df["Close"].resample("M").last().dropna()
-    return ensure_series(m)
-
-def trailing_12m_return(monthly: pd.Series) -> float:
-    """최근 월말 기준 12개월 수익률 (비율, 0.1234=12.34%)."""
-    if len(monthly) < 13:
-        raise RuntimeError("12개월 수익률 계산에 필요한 월말 데이터가 부족합니다.")
-    p0 = float(monthly.iloc[-1])     # 최근 월말
-    p12 = float(monthly.iloc[-13])   # 12개월 전 월말
-    return (p0 / p12) - 1.0
-
-
-# =========================
-# 의사결정 로직 (듀얼모멘텀)
-# =========================
-def decide_allocation():
-    # 월말 시계열
-    m_spy = monthly_close("SPY")
-    m_efa = monthly_close("EFA")
-    m_bil = monthly_close("BIL")
-    m_agg = monthly_close("AGG")
-
-    # 최근 12M 수익률
-    r_spy = trailing_12m_return(m_spy)
-    r_efa = trailing_12m_return(m_efa)
-    r_bil = trailing_12m_return(m_bil)
-    r_agg = trailing_12m_return(m_agg)
-
-    # 룰:
-    # 1) SPY 12M > BIL 12M → SPY vs EFA 중 12M 높은 ETF
-    # 2) 아니면 AGG
-    if r_spy > r_bil:
-        chosen_us = "SPY" if r_spy >= r_efa else "EFA"
-        rule_text = f"[룰1] SPY(12M={r_spy*100:.2f}%) > BIL(12M={r_bil*100:.2f}%) → SPY vs EFA 중 더 높은 12M → {chosen_us}"
-    else:
-        chosen_us = "AGG"
-        rule_text = f"[룰2] SPY(12M={r_spy*100:.2f}%) ≤ BIL(12M={r_bil*100:.2f}%) → AGG 선택"
-
-    # 실제 투자 배분표
-    kr_alloc = pd.DataFrame(KR_MAPPING[chosen_us])
-
-    # 요약표 (미국ETF 12M 수익률)
-    summary = pd.DataFrame({
-        "US_Ticker": ["SPY", "EFA", "BIL", "AGG"],
-        "라벨": [US_TICKERS["SPY"], US_TICKERS["EFA"], US_TICKERS["BIL"], US_TICKERS["AGG"]],
-        "12M수익률(%)": [round(r_spy*100, 2), round(r_efa*100, 2), round(r_bil*100, 2), round(r_agg*100, 2)]
-    })
-
-    # 배너 문구
-    alloc_text = " + ".join([f"{row['종목명']}({row['Code']}) {row['비중(%)']:.0f}%" for _, row in kr_alloc.iterrows()])
-    banner = f"이번달 실제 투자 대상: {alloc_text}  |  결정근거: {rule_text}"
-
-    # 기준자산의 12M(%) 값 (Allocation 시트에 참고용으로 넣기)
-    chosen_12m_pct = r_spy*100 if chosen_us == "SPY" else (r_efa*100 if chosen_us == "EFA" else r_agg*100)
-
-    return summary, kr_alloc, banner, chosen_us, round(chosen_12m_pct, 2)
-
-
-# =========================
-# Returns 시트 데이터 (미국/국내 모두)
-# =========================
-def build_returns_sheet_data():
-    rows = []
-
-    # 미국 ETF 12M
-    for t, label in US_TICKERS.items():
-        try:
-            r = trailing_12m_return(monthly_close(t)) * 100
-            rows.append(["미국", label, t, None, None, round(r, 2)])
-        except Exception:
-            rows.append(["미국", label, t, None, None, None])
-
-    # 국내 ETF 12M (야후 '.KS')
-    for code in KR_CODES:
-        y_ticker = f"{code}.KS"
-        label = f"국내 ETF {code}"
-        try:
-            r = trailing_12m_return(monthly_close(y_ticker)) * 100
-            rows.append(["국내", label, None, code, "KS", round(r, 2)])
-        except Exception:
-            rows.append(["국내", label, None, code, "KS", None])
-
-    return pd.DataFrame(rows, columns=["구분","자산라벨","US_Ticker","KR_Code","시장","12M수익률(%)"])
-
-
-# =========================
-# 새 기능: EFA vs 251350 비교 데이터
-# =========================
-def build_compare_efa_vs_251350():
-    """
-    반환:
-      metrics_df: 12/24/36M 상관계수 & 추적지표(누적차이, 평균월간차이, Tracking Error) & 최근 3개월 거래량 비교
-      detail_df:  최근 36개월 월간 수익률(%) 시계열 비교표
-    """
-    # 월말 종가(Series 강제)
-    m_efa = monthly_close("EFA")
-    m_251 = monthly_close("251350.KS")
-
-    # 공통 구간 정렬
-    idx = m_efa.index.intersection(m_251.index)
-    m_efa = m_efa.loc[idx].copy()
-    m_251 = m_251.loc[idx].copy()
-
-    # 월간 수익률(Series 강제)
-    r_efa = ensure_series(m_efa.pct_change().dropna())
-    r_251 = ensure_series(m_251.pct_change().dropna())
-    ridx = r_efa.index.intersection(r_251.index)
-    r_efa = r_efa.loc[ridx]
-    r_251 = r_251.loc[ridx]
-
-    def _window_slice(s: pd.Series, months: int):
-        return s.iloc[-months:] if len(s) >= months else s.copy()
-
-    def _cumret(x: pd.Series) -> float:
-        return float((1.0 + x).prod() - 1.0) if len(x) else np.nan
-
-    rows = []
-    for win in [12, 24, 36]:
-        re = _window_slice(r_efa, win)
-        rk = _window_slice(r_251, win)
-        # 길이/정렬 동일 보장
-        ridx2 = re.index.intersection(rk.index)
-        re = re.loc[ridx2]
-        rk = rk.loc[ridx2]
-
-        if len(re) > 2 and len(rk) == len(re):
-            # Series.corr 대신 np.corrcoef로 안전 계산
-            corr_val = float(np.corrcoef(re.values, rk.values)[0, 1])
-            cum_diff = _cumret(rk) - _cumret(re)
-            diff = (rk - re)
-            mean_diff = float(diff.mean())
-            te_monthly = float(diff.std(ddof=1)) if len(diff) > 2 else np.nan
-            te_annual = te_monthly * np.sqrt(12) if np.isfinite(te_monthly) else np.nan
+def get_monthly_close(ticker, start="2015-01-01"):
+    """야후 파이낸스에서 월말 수정종가(Adj Close) 가져오기"""
+    try:
+        df = yf.download(ticker, start=start, progress=False, auto_adjust=True)
+        if df.empty:
+            return pd.Series(dtype=float)
+        
+        # 'Close' 컬럼 추출 (MultiIndex 처리)
+        if isinstance(df.columns, pd.MultiIndex):
+            # yfinance 최신 버전 대응
+            try:
+                s = df["Close"][ticker]
+            except KeyError:
+                s = df.iloc[:, 0] # 첫번째 컬럼 강제 선택
         else:
-            corr_val = cum_diff = mean_diff = te_monthly = te_annual = np.nan
+            s = df["Close"]
+            
+        # 월말 리샘플링
+        monthly = s.resample("M").last().dropna()
+        return monthly
+    except Exception as e:
+        print(f"Error fetching {ticker}: {e}")
+        return pd.Series(dtype=float)
 
-        rows.append([
-            f"{win}M",
-            None if not np.isfinite(corr_val) else round(corr_val, 4),
-            None if not np.isfinite(cum_diff) else round(cum_diff * 100, 2),
-            None if not np.isfinite(mean_diff) else round(mean_diff * 100, 3),
-            None if not np.isfinite(te_monthly) else round(te_monthly * 100, 3),
-            None if not np.isfinite(te_annual) else round(te_annual * 100, 3),
-        ])
-
-    metrics_df = pd.DataFrame(rows, columns=[
-        "구간", "상관계수(월수익률)", "누적수익률 차이(국내−EFA, %)",
-        "평균 월간 차이(%, 국내−EFA)", "Tracking Error(月, %)", "Tracking Error(연율, %)"
-    ])
-
-    # 거래량 비교(최근 3개월, 일봉)
-    d_efa = yf.download("EFA", period="4mo", interval="1d", progress=False)
-    d_251 = yf.download("251350.KS", period="4mo", interval="1d", progress=False)
-
-    def last_n_months_mean_median_vol(df: pd.DataFrame, days=90):
-        if df is None or df.empty or "Volume" not in df:
-            return np.nan, np.nan
-        last = df.tail(days)["Volume"].dropna()
-        if last.empty:
-            return np.nan, np.nan
-        return float(last.mean()), float(last.median())
-
-    efa_mean, efa_med = last_n_months_mean_median_vol(d_efa)
-    k_mean, k_med   = last_n_months_mean_median_vol(d_251)
-
-    vol_df = pd.DataFrame([
-        ["EFA", efa_mean, efa_med],
-        ["251350.KS", k_mean, k_med],
-    ], columns=["티커", "최근3개월 일평균 거래량", "최근3개월 일중앙 거래량"])
-
-    # 상세 시계열(최근 36개월 월수익률 %)
-    r_join = pd.concat([
-        ensure_series(r_efa).rename("EFA"),
-        ensure_series(r_251).rename("251350.KS"),
-    ], axis=1).dropna()
-    r_detail = r_join.tail(36) * 100.0
-    r_detail.index = r_detail.index.strftime("%Y-%m")
-
-    return metrics_df, vol_df, r_detail.reset_index().rename(columns={"index": "월"})
-
+def calc_12m_return(monthly_series):
+    """최근 12개월 수익률 계산 (현재 월말 / 12개월 전 월말 - 1)"""
+    if len(monthly_series) < 13:
+        return None
+    p_now = float(monthly_series.iloc[-1])
+    p_prev = float(monthly_series.iloc[-13])
+    return (p_now / p_prev) - 1.0
 
 # =========================
-# 엑셀 저장
+# 3. 핵심 로직: [대안 3] 적용
 # =========================
-def autosize_columns(ws, max_width=46):
-    widths = {}
-    for row in ws.iter_rows(values_only=True):
-        for i, v in enumerate(row, start=1):
-            v = "" if v is None else str(v)
-            widths[i] = max(widths.get(i, 0), len(v))
-    for i, w in widths.items():
-        ws.column_dimensions[get_column_letter(i)].width = min(max(w + 2, 10), max_width)
+def run_dual_momentum_alt3():
+    print(">>> 데이터 수집 중...")
+    
+    # 1) 데이터 가져오기
+    m_spy = get_monthly_close(TICKER_DECISION["US"])
+    m_bil = get_monthly_close(TICKER_DECISION["CASH"])
+    m_eu  = get_monthly_close(TICKER_DECISION["EU_ETF"])
+    m_jp  = get_monthly_close(TICKER_DECISION["JP_ETF"])
 
-def save_excel(summary: pd.DataFrame, alloc: pd.DataFrame, banner: str, chosen_us: str, chosen_12m_pct: float,
-               returns_df: pd.DataFrame, cmp_metrics: pd.DataFrame, cmp_vol: pd.DataFrame, cmp_detail: pd.DataFrame):
+    # 2) '합성 선진국 지수' 만들기 (유로50 + 니케이225 반반)
+    # - 날짜 인덱스 맞추기 (교집합)
+    idx = m_eu.index.intersection(m_jp.index)
+    if len(idx) < 13:
+        raise ValueError("국내 ETF 데이터가 부족하여 12개월 모멘텀을 계산할 수 없습니다. (상장일 확인 필요)")
+    
+    m_eu = m_eu.loc[idx]
+    m_jp = m_jp.loc[idx]
+    
+    # - 월간 수익률 계산
+    r_eu = m_eu.pct_change().fillna(0)
+    r_jp = m_jp.pct_change().fillna(0)
+    
+    # - 합성 수익률 (50:50 리밸런싱 가정)
+    r_composite = (r_eu * 0.5) + (r_jp * 0.5)
+    
+    # - 합성 지수화 (기준일 1.0 시작)
+    #   (1+r).cumprod()를 통해 12개월 수익률 계산용 가상의 가격(Index) 생성
+    m_composite_idx = (1 + r_composite).cumprod()
+
+    # 3) 12개월 모멘텀 계산
+    mom_spy = calc_12m_return(m_spy)
+    mom_bil = calc_12m_return(m_bil)
+    mom_composite = calc_12m_return(m_composite_idx) # 우리가 만든 합성 지수의 12개월 수익률
+
+    if any(x is None for x in [mom_spy, mom_bil, mom_composite]):
+        raise ValueError("최근 12개월 데이터가 부족합니다.")
+
+    # 4) 듀얼모멘텀 판정 로직
+    # Rule 1: 공격자산(SPY)이 안전자산(BIL)보다 좋은가? (절대모멘텀)
+    #         * SPY 대신 Composite가 더 좋으면 Composite로도 비교해야 하나,
+    #           전통 듀얼모멘텀은 보통 SPY를 기준으로 Market Stress를 판단하기도 함.
+    #           여기서는 [SPY vs BIL] 비교 후, 공격 모드면 [SPY vs Composite] 승자를 고름.
+    #           (단, 승자가 마이너스 모멘텀이면 BIL로 가는 로직도 추가 가능. 여기서는 Gary Antonacci 오리지널에 가깝게 SPY>BIL이면 공격으로 간주)
+    
+    decision_log = []
+    final_choice = ""
+    
+    # 절대 모멘텀 체크 (SPY가 현금보다 강한가?)
+    # *보수적 변형: SPY와 Composite 둘 중 이기는 놈이 BIL보다 커야 한다.
+    winner_mom = max(mom_spy, mom_composite)
+    winner_name = "SPY" if mom_spy >= mom_composite else "Composite(EU+JP)"
+    
+    decision_log.append(f"1. 각 자산 12개월 수익률")
+    decision_log.append(f"   - SPY (미국): {mom_spy:.2%}")
+    decision_log.append(f"   - 합성 (유로+니케이): {mom_composite:.2%}")
+    decision_log.append(f"   - BIL (초단기채): {mom_bil:.2%}")
+    
+    if winner_mom > mom_bil:
+        # 공격 자산 매수
+        if winner_name == "SPY":
+            final_choice = "US_WIN"
+            reason = f"공격모드 ON: SPY({mom_spy:.2%})가 합성({mom_composite:.2%}) 및 BIL보다 우위"
+        else:
+            final_choice = "NON_US_WIN"
+            reason = f"공격모드 ON: 합성({mom_composite:.2%})이 SPY({mom_spy:.2%}) 및 BIL보다 우위"
+    else:
+        # 수비 자산 매수
+        final_choice = "DEFENSIVE"
+        reason = f"수비모드 ON: 1등({winner_name}, {winner_mom:.2%})이 BIL({mom_bil:.2%})보다 낮음"
+
+    print(f"\n[판정 결과] {reason}")
+    
+    return {
+        "mom_spy": mom_spy,
+        "mom_composite": mom_composite,
+        "mom_bil": mom_bil,
+        "final_choice": final_choice,
+        "reason": reason,
+        "m_composite_idx": m_composite_idx  # 차트/기록용
+    }
+
+# =========================
+# 4. 엑셀 리포트 생성
+# =========================
+def save_report_to_excel(res_data):
     month_str = datetime.now().strftime("%Y-%m")
-    xlsx_path = os.path.join(OUT_DIR, f"dualmo_report_{month_str}.xlsx")
+    filename = f"DualMomentum_ISA_Alt3_{month_str}.xlsx"
+    filepath = os.path.join(OUT_DIR, filename)
 
     wb = Workbook()
-    wb.remove(wb.active)
+    
+    # 스타일 정의
+    title_font = Font(size=14, bold=True, color="FFFFFF")
+    title_fill = PatternFill("solid", fgColor="4472C4") # 파란색 헤더
+    header_fill = PatternFill("solid", fgColor="D9E1F2")
+    center_align = Alignment(horizontal="center", vertical="center")
+    border_thin = Border(left=Side(style='thin'), right=Side(style='thin'), 
+                         top=Side(style='thin'), bottom=Side(style='thin'))
 
-    title_fill = PatternFill("solid", fgColor="E6F0FF")
-    header_fill = PatternFill("solid", fgColor="F2F2F2")
-    thin = Side(style="thin", color="D9D9D9")
-    border_all = Border(left=thin, right=thin, top=thin, bottom=thin)
+    # --- Sheet 1: 투자 리포트 ---
+    ws = wb.active
+    ws.title = "ISA 투자지시서"
+    
+    # 1. 제목
+    ws.merge_cells("A1:E1")
+    ws["A1"] = f"ISA 듀얼모멘텀 (대안3: 완전일치형) - {month_str}"
+    ws["A1"].font = title_font
+    ws["A1"].fill = title_fill
+    ws["A1"].alignment = center_align
+    
+    # 2. 이번 달 결정
+    ws["A3"] = "결정 내역"
+    ws["A3"].font = Font(bold=True)
+    ws["B3"] = res_data["reason"]
+    
+    # 3. 모멘텀 비교표
+    headers = ["자산군", "티커(Data)", "12개월 수익률", "비고"]
+    data_rows = [
+        ["미국 주식", TICKER_DECISION["US"], res_data["mom_spy"], "S&P500 기준"],
+        ["선진국(비미국)", "합성(195930+241180)", res_data["mom_composite"], "유로50+니케이225 (5:5)"],
+        ["현금/채권", TICKER_DECISION["CASH"], res_data["mom_bil"], "Risk Free 기준"]
+    ]
+    
+    # 표 헤더
+    for col, h in enumerate(headers, 1):
+        c = ws.cell(row=5, column=col, value=h)
+        c.fill = header_fill
+        c.font = Font(bold=True)
+        c.alignment = center_align
+        c.border = border_thin
 
-    # === Sheet 1: Decision (미국ETF 12M 수익률 요약) ===
-    ws1 = wb.create_sheet("Decision")
-    ws1.merge_cells(start_row=1, start_column=1, end_row=1, end_column=6)
-    c = ws1.cell(row=1, column=1, value=f"SPY/EFA/BIL 12M 모멘텀 의사결정 — {month_str}")
-    c.font = Font(size=14, bold=True); c.fill = title_fill
-    c.alignment = Alignment(horizontal="center", vertical="center")
-    ws1.row_dimensions[1].height = 24
+    # 표 내용
+    for i, row in enumerate(data_rows, 6):
+        ws.cell(row=i, column=1, value=row[0]).border = border_thin
+        ws.cell(row=i, column=2, value=row[1]).border = border_thin
+        ws.cell(row=i, column=3, value=row[2]).number_format = '0.00%'
+        ws.cell(row=i, column=3).border = border_thin
+        ws.cell(row=i, column=4, value=row[3]).border = border_thin
+        
+        # 승자 강조 (Bold + Color)
+        val = row[2]
+        if val == max(res_data["mom_spy"], res_data["mom_composite"], res_data["mom_bil"]):
+             ws.cell(row=i, column=3).font = Font(bold=True, color="FF0000")
 
-    ws1.cell(row=3, column=1, value=banner).font = Font(bold=True)
+    # 4. 실제 매수 포트폴리오 (Allocation)
+    ws["A9"] = "📢 이번 달 매수 종목 (ISA 계좌)"
+    ws["A9"].font = Font(bold=True, size=12)
+    
+    alloc_headers = ["구분", "종목명", "종목코드", "투자비중"]
+    for col, h in enumerate(alloc_headers, 1):
+        c = ws.cell(row=10, column=col, value=h)
+        c.fill = header_fill
+        c.font = Font(bold=True)
+        c.alignment = center_align
+        c.border = border_thin
+        
+    target_portfolio = ALLOCATION_MAP[res_data["final_choice"]]
+    
+    start_row = 11
+    for item in target_portfolio:
+        ws.cell(row=start_row, column=1, value=item["지역"]).border = border_thin
+        ws.cell(row=start_row, column=2, value=item["종목명"]).border = border_thin
+        ws.cell(row=start_row, column=3, value=item["Code"]).border = border_thin
+        
+        c_weight = ws.cell(row=start_row, column=4, value=item["비중"])
+        c_weight.number_format = '0%'
+        c_weight.border = border_thin
+        c_weight.fill = PatternFill("solid", fgColor="FFF2CC") # 노란색 강조
+        start_row += 1
 
-    for col, h in enumerate(summary.columns, start=1):
-        cell = ws1.cell(row=5, column=col, value=h)
-        cell.font = Font(bold=True); cell.fill = header_fill
-        cell.border = border_all; cell.alignment = Alignment(horizontal="center")
+    # 컬럼 너비 조정
+    ws.column_dimensions["A"].width = 15
+    ws.column_dimensions["B"].width = 35
+    ws.column_dimensions["C"].width = 20
+    ws.column_dimensions["D"].width = 20
+    ws.column_dimensions["E"].width = 30
 
-    for r_idx, row in enumerate(summary.itertuples(index=False), start=6):
-        for c_idx, val in enumerate(row, start=1):
-            cell = ws1.cell(row=r_idx, column=c_idx, value=val)
-            cell.border = border_all
-            if summary.columns[c_idx-1].endswith("(%)") and isinstance(val, (int, float)):
-                cell.number_format = "0.00%"; cell.value = val / 100.0
-
-    ws1.freeze_panes = "A6"
-    autosize_columns(ws1, max_width=36)
-
-    # === Sheet 2: Allocation (실제 투자) ===
-    ws2 = wb.create_sheet("Allocation")
-    ws2.merge_cells(start_row=1, start_column=1, end_row=1, end_column=7)
-    c2 = ws2.cell(row=1, column=1, value=f"실제 투자 배분 (국내 ETF) — {month_str}")
-    c2.font = Font(size=14, bold=True); c2.fill = title_fill
-    c2.alignment = Alignment(horizontal="center", vertical="center")
-    ws2.row_dimensions[1].height = 24
-
-    headers2 = ["분류","종목명","Code","환율","비중(%)","(참고) 기준자산","(참고) 기준자산 12M(%)"]
-    for col, h in enumerate(headers2, start=1):
-        cell = ws2.cell(row=3, column=col, value=h)
-        cell.font = Font(bold=True); cell.fill = header_fill
-        cell.border = border_all; cell.alignment = Alignment(horizontal="center")
-
-    r_idx = 4
-    for _, row in alloc.iterrows():
-        ws2.cell(row=r_idx, column=1, value=row["분류"]).border = border_all
-        ws2.cell(row=r_idx, column=2, value=row["종목명"]).border = border_all
-        ws2.cell(row=r_idx, column=3, value=row["Code"]).border = border_all
-        ws2.cell(row=r_idx, column=4, value=row["환율"]).border = border_all
-
-        pct = float(row["비중(%)"]) / 100.0
-        c = ws2.cell(row=r_idx, column=5, value=pct)
-        c.border = border_all; c.number_format = "0.00%"
-
-        ws2.cell(row=r_idx, column=6, value=US_TICKERS[chosen_us]).border = border_all
-
-        c12 = ws2.cell(row=r_idx, column=7, value=chosen_12m_pct / 100.0)
-        c12.border = border_all; c12.number_format = "0.00%"
-
-        r_idx += 1
-
-    ws2.freeze_panes = "A4"
-    autosize_columns(ws2, max_width=46)
-
-    # === Sheet 3: Returns (미국/국내 각 자산 12M 수익률) ===
-    ws3 = wb.create_sheet("Returns")
-    ws3.merge_cells(start_row=1, start_column=1, end_row=1, end_column=6)
-    c3 = ws3.cell(row=1, column=1, value=f"각 자산 12개월 수익률 — {month_str}")
-    c3.font = Font(size=14, bold=True); c3.fill = title_fill
-    c3.alignment = Alignment(horizontal="center", vertical="center")
-    ws3.row_dimensions[1].height = 24
-
-    for col, h in enumerate(returns_df.columns, start=1):
-        cell = ws3.cell(row=3, column=col, value=h)
-        cell.font = Font(bold=True); cell.fill = header_fill
-        cell.border = border_all; cell.alignment = Alignment(horizontal="center")
-
-    for r_idx, row in enumerate(returns_df.itertuples(index=False), start=4):
-        for c_idx, val in enumerate(row, start=1):
-            cell = ws3.cell(row=r_idx, column=c_idx, value=val)
-            cell.border = border_all
-            if returns_df.columns[c_idx-1].endswith("(%)") and isinstance(val, (int, float)):
-                cell.number_format = "0.00%"; cell.value = val / 100.0
-
-    autosize_columns(ws3, max_width=46)
-
-    # === Sheet 4: Compare_EFA_vs_251350 ===
-    ws4 = wb.create_sheet("Compare_EFA_vs_251350")
-    ws4.merge_cells(start_row=1, start_column=1, end_row=1, end_column=8)
-    c4 = ws4.cell(row=1, column=1, value=f"EFA vs KODEX MSCI선진국(251350) 비교 — {month_str}")
-    c4.font = Font(size=14, bold=True); c4.fill = title_fill
-    c4.alignment = Alignment(horizontal="center", vertical="center")
-    ws4.row_dimensions[1].height = 24
-
-    # (A) 상관/추적 지표 표
-    ws4.cell(row=3, column=1, value="A. 상관 & 추적지표").font = Font(bold=True)
-    start_row = 5
-    for col, h in enumerate(cmp_metrics.columns, start=1):
-        cell = ws4.cell(row=start_row, column=col, value=h)
-        cell.font = Font(bold=True); cell.fill = header_fill
-        cell.border = border_all; cell.alignment = Alignment(horizontal="center")
-
-    for r_idx, row in enumerate(cmp_metrics.itertuples(index=False), start=start_row+1):
-        for c_idx, val in enumerate(row, start=1):
-            ws4.cell(row=r_idx, column=c_idx, value=val).border = border_all
-
-    # (B) 최근 3개월 거래량 표
-    r2 = start_row + 1 + len(cmp_metrics) + 2
-    ws4.cell(row=r2, column=1, value="B. 최근 3개월 일별 거래량(단순)").font = Font(bold=True)
-    for col, h in enumerate(cmp_vol.columns, start=1):
-        cell = ws4.cell(row=r2+2, column=col, value=h)
-        cell.font = Font(bold=True); cell.fill = header_fill
-        cell.border = border_all; cell.alignment = Alignment(horizontal="center")
-    for r_idx, row in enumerate(cmp_vol.itertuples(index=False), start=r2+3):
-        for c_idx, val in enumerate(row, start=1):
-            ws4.cell(row=r_idx, column=c_idx, value=val).border = border_all
-
-    # (C) 최근 36개월 월수익률(%) 비교표
-    r3 = r2 + 3 + len(cmp_vol) + 2
-    ws4.cell(row=r3, column=1, value="C. 최근 36개월 월간 수익률(%)").font = Font(bold=True)
-    for col, h in enumerate(cmp_detail.columns, start=1):
-        cell = ws4.cell(row=r3+2, column=col, value=h)
-        cell.font = Font(bold=True); cell.fill = header_fill
-        cell.border = border_all; cell.alignment = Alignment(horizontal="center")
-    for r_idx, row in enumerate(cmp_detail.itertuples(index=False), start=r3+3):
-        for c_idx, val in enumerate(row, start=1):
-            cell = ws4.cell(row=r_idx, column=c_idx, value=val)
-            cell.border = border_all
-            if c_idx >= 2 and isinstance(val, (int, float)):
-                cell.number_format = "0.00"
-
-    autosize_columns(ws4, max_width=52)
-
-    # 저장
-    wb.save(xlsx_path)
-    print(f"✅ 엑셀 저장 완료: {xlsx_path}")
-
+    wb.save(filepath)
+    print(f"✅ 리포트 생성 완료: {filepath}")
 
 # =========================
-# main
+# Main Execution
 # =========================
 if __name__ == "__main__":
-    # 듀얼모멘텀 의사결정 및 기본 시트
-    summary_df, alloc_df, banner_txt, chosen_us, chosen_12m_pct = decide_allocation()
-    returns_df = build_returns_sheet_data()
-
-    # 비교 시트(EFA vs 251350)
-    cmp_metrics_df, cmp_vol_df, cmp_detail_df = build_compare_efa_vs_251350()
-
-    # 엑셀 저장
-    save_excel(summary_df, alloc_df, banner_txt, chosen_us, chosen_12m_pct,
-               returns_df, cmp_metrics_df, cmp_vol_df, cmp_detail_df)
-
-    print("📌", banner_txt)
+    try:
+        # 1. 듀얼모멘텀 분석 실행
+        result = run_dual_momentum_alt3()
+        
+        # 2. 결과 엑셀 저장
+        save_report_to_excel(result)
+        
+    except Exception as e:
+        print(f"❌ 실행 중 오류 발생: {e}")
